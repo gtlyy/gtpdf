@@ -1,5 +1,6 @@
 # GtPDF
 ![](./screenshot.png)
+<hr>
 
 跨平台 PDF 工具箱，基于 Go + [Fyne](https://fyne.io/) 构建。
 
@@ -44,8 +45,8 @@
 ### Linux (ARM64, glibc 2.28+)
 
 ```bash
-./build_linux_arm64.sh        # 一次性构建
 ./build_linux_arm64_quick.sh  # 快速增量构建（持久容器）
+./build_linux_arm64_glibc2.23.sh # ocr暂不支持
 ```
 
 ### Windows 10+（从 Linux 交叉编译）
