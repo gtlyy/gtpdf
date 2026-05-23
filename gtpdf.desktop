@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GtPDF
+Comment=PDF 阅读器与工具箱
+Exec=__GTPDF_BIN__ %f
+Icon=__GTPDF_ICON__
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupNotify=true

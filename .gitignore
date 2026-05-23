@@ -1,0 +1,38 @@
+# Binaries
+gtpdf
+*.exe
+
+# PDF output (test files)
+*.pdf
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build directories
+fyne-cross/
+gtpdf_windows/
+gtpdf_linux_arm64/
+gtpdf_linux_amd64/
+gtpdf_linux_arm64_glibc2.23/
+gtpdf_linux_arm64_glibc2.23/LICENSE
+testdata/*
+!testdata/eth.pdf
+!testdata/ru_geng_zai_hou.pdf
+!testdata/testpp_1.png
+!testdata/testpp_2.png
+
+# PDFium SDK binaries (downloaded at build time)
+libpdfium.so
+libpdfium.so.*
+pdfium.dll
+pdfembed/libpdfium_linux_amd64.so
+pdfembed/libpdfium_linux_arm64.so
+
+ocrembed/lib*.so*
+
+# Generated font cache (not embedded, regenerated at runtime)
+WenQuanYiMicroHei.gob
+screenshot.png
