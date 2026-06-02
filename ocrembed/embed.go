@@ -3,6 +3,7 @@
 package ocrembed
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -22,7 +23,7 @@ func Init() (string, bool) {
 		return "", false
 	}
 
-	dir := filepath.Join(os.TempDir(), "gtpdf_ocr")
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("gtpdf_ocr_%d", os.Getpid()))
 	os.MkdirAll(dir, 0755)
 
 	for name, data := range embedFiles {

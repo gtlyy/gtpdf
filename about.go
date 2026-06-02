@@ -8,7 +8,7 @@ import (
 
 func createAboutTab(win fyne.Window) *container.TabItem {
 	content := container.NewVBox()
-	content.Add(widget.NewLabelWithStyle("GtPDF V1.8", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}))
+	content.Add(widget.NewLabelWithStyle("GtPDF V1.8.1", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}))
 
 	authorLabel := widget.NewLabel("作者: gtlyy")
 	content.Add(authorLabel)
@@ -19,8 +19,8 @@ func createAboutTab(win fyne.Window) *container.TabItem {
 	content.Add(descLabel)
 
 	features := []string{
-		"• 阅读 - 渲染、缩放 (0.1x–5x)、平移、文本选择、全文搜索、书签、链接、夜间模式",
-		"• 标注 - 高亮/下划线/波浪线/删除线、矩形/填充、线段、自由文本、9 色调色板",
+		"• 阅读 - 渲染、缩放 (0.1x–5x)、平移、文本选择、全文搜索、书签、夜间模式",
+		"• 标注 - 高亮/下划线/波浪线/删除线、矩形/填充、自由文本、9 色调色板",
 		"• 笔记 - JSON 侧载文件存储，悬停工具提示，多种颜色",
 		"• OCR - 选区或全页文字识别（中英文）",
 		"• 导出 - 标注页导出 PNG/JPEG，含进度提示，支持合并为一张图片",
