@@ -1,11 +1,13 @@
 package main
 
 import (
+	"container/list"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"math"
+	"os"
 	"sort"
 	"sync"
 
@@ -14,6 +16,8 @@ import (
 	"github.com/klippa-app/go-pdfium/enums"
 	"github.com/klippa-app/go-pdfium/references"
 	"github.com/klippa-app/go-pdfium/structs"
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 type PDFiumDoc struct {
@@ -23,6 +27,8 @@ type PDFiumDoc struct {
 	pages       []*PDFiumPage
 	mu          sync.RWMutex
 	zoomCache   map[zoomCacheKeyPlus]*image.RGBA
+	zoomLRU     list.List
+	zoomLRUElem map[zoomCacheKeyPlus]*list.Element
 	zoomMu      sync.Mutex
 	textCache   map[int]*pdfium_plus.PageText
 	textCacheMu sync.Mutex
@@ -53,16 +59,65 @@ func LoadPDFiumDocument(path string) (*PDFiumDoc, error) {
 		filePath:  path,
 		numPages:  doc.PageCount(),
 		zoomCache: make(map[zoomCacheKeyPlus]*image.RGBA),
+		zoomLRUElem: make(map[zoomCacheKeyPlus]*list.Element),
 		textCache: make(map[int]*pdfium_plus.PageText),
 	}
 
 	pdfDoc.pages = make([]*PDFiumPage, pdfDoc.numPages)
+
+	// Pre-load page dimensions via pdfcpu (pure Go, no PDFium, <10ms for all pages)
+	// This avoids FPDF_LoadPage for simple GetPagePlus calls (which can take 21s for complex pages)
+	f, err := os.Open(path)
+	if err == nil {
+		boundaries, err := api.Boxes(f, nil, model.NewDefaultConfiguration())
+		f.Close()
+		if err == nil {
+			for i, pb := range boundaries {
+				if i >= pdfDoc.numPages {
+					break
+				}
+				mb := pb.CropBox()
+				if mb == nil {
+					mb = pb.MediaBox()
+				}
+				if mb != nil {
+					pdfDoc.pages[i] = &PDFiumPage{
+						Index:    i,
+						Width:    mb.Width(),
+						Height:   mb.Height(),
+						Rotation: pb.Rot,
+						Loaded:   true,
+					}
+				}
+			}
+		}
+	}
+
+	// For any pages not loaded via pdfcpu, fall back to default sizes
+	for i := range pdfDoc.pages {
+		if pdfDoc.pages[i] == nil {
+			pdfDoc.pages[i] = &PDFiumPage{
+				Index:  i,
+				Width:  612,
+				Height: 792,
+				Loaded: false,
+			}
+		}
+	}
 
 	return pdfDoc, nil
 }
 
 func (d *PDFiumDoc) PageCountPlus() int {
 	return d.numPages
+}
+
+func (d *PDFiumDoc) InvalidateDimensions(pageIndex int) {
+	d.mu.Lock()
+	if pageIndex >= 0 && pageIndex < len(d.pages) {
+		d.pages[pageIndex] = nil
+	}
+	d.mu.Unlock()
 }
 
 func (d *PDFiumDoc) FilePath() string {
@@ -125,8 +180,14 @@ func (d *PDFiumDoc) RenderPagePlus(pageIndex int, zoom float32, canvasScale floa
 		nightMode: nightMode,
 	}
 
+	const cacheLimit = 50
+
 	d.zoomMu.Lock()
 	if img, ok := d.zoomCache[key]; ok {
+		// Cache HIT: move to front (most recently used)
+		if elem, ok := d.zoomLRUElem[key]; ok {
+			d.zoomLRU.MoveToFront(elem)
+		}
 		d.zoomMu.Unlock()
 		logD("[cache HIT]  page=%d zoom=%.2f dpi=%.1f rounded=%d nm=%v  (cache size=%d)",
 			pageIndex+1, zoom, dpi, roundedDPI, nightMode, len(d.zoomCache))
@@ -153,12 +214,19 @@ func (d *PDFiumDoc) RenderPagePlus(pageIndex int, zoom float32, canvasScale floa
 	}
 
 	d.zoomMu.Lock()
-	if len(d.zoomCache) < 50 {
-		d.zoomCache[key] = result
-		logD("[cache store] page=%d dpi=%d -> cache size=%d", pageIndex+1, roundedDPI, len(d.zoomCache))
-	} else {
-		logI("[cache FULL]  page=%d dpi=%d (limit 50 reached, not stored)", pageIndex+1, roundedDPI)
+	// Evict LRU entry if at limit
+	if len(d.zoomCache) >= cacheLimit {
+		if back := d.zoomLRU.Back(); back != nil {
+			evict := back.Value.(zoomCacheKeyPlus)
+			delete(d.zoomCache, evict)
+			delete(d.zoomLRUElem, evict)
+			d.zoomLRU.Remove(back)
+			logD("[cache evict] page=%d dpi=%d (limit %d)", evict.page+1, evict.dpi, cacheLimit)
+		}
 	}
+	d.zoomCache[key] = result
+	d.zoomLRUElem[key] = d.zoomLRU.PushFront(key)
+	logD("[cache store] page=%d dpi=%d -> cache size=%d", pageIndex+1, roundedDPI, len(d.zoomCache))
 	d.zoomMu.Unlock()
 
 	return result, nil
@@ -307,9 +375,19 @@ func (d *PDFiumDoc) AnnotMoveFreeText(pageIndex, annotIndex int, dx, dy float32)
 	return d.doc.AnnotMoveFreeText(pageIndex, annotIndex, dx, dy)
 }
 
+func (d *PDFiumDoc) ClearZoomCache() {
+	d.zoomMu.Lock()
+	d.zoomCache = make(map[zoomCacheKeyPlus]*image.RGBA)
+	d.zoomLRU.Init()
+	d.zoomLRUElem = make(map[zoomCacheKeyPlus]*list.Element)
+	d.zoomMu.Unlock()
+}
+
 func (d *PDFiumDoc) Close() {
 	d.zoomMu.Lock()
 	d.zoomCache = make(map[zoomCacheKeyPlus]*image.RGBA)
+	d.zoomLRU.Init()
+	d.zoomLRUElem = make(map[zoomCacheKeyPlus]*list.Element)
 	d.zoomMu.Unlock()
 	d.textCacheMu.Lock()
 	d.textCache = make(map[int]*pdfium_plus.PageText)

@@ -190,6 +190,7 @@ func (r *noteMarkerRenderer) Objects() []fyne.CanvasObject {
 type NoteLayer struct {
 	widget.BaseWidget
 	viewer     *PDFViewerPlus
+	PageIdx    int
 	noteMode   bool
 	pageWidth  float64
 	pageHeight float64
@@ -202,6 +203,7 @@ type NoteLayer struct {
 type NoteHoverLayer struct {
 	widget.BaseWidget
 	viewer        *PDFViewerPlus
+	PageIdx       int
 	pageWidth     float64
 	pageHeight    float64
 	imgOffX       float32
@@ -270,7 +272,7 @@ func (nl *NoteLayer) MouseDown(ev *desktop.MouseEvent) {
 		return
 	}
 
-	notes := nl.viewer.noteStore.GetByPage(nl.viewer.currentPage - 1)
+	notes := nl.viewer.noteStore.GetByPage(nl.PageIdx)
 	for _, n := range notes {
 		nScreenX, nScreenY := nl.pdfToScreen(n.PdfX, n.PdfY)
 		hitRadius := float32(15)
@@ -345,7 +347,7 @@ func (hl *NoteHoverLayer) MouseMoved(ev *desktop.MouseEvent) {
 		return
 	}
 
-	notes := hl.viewer.noteStore.GetByPage(hl.viewer.currentPage - 1)
+	notes := hl.viewer.noteStore.GetByPage(hl.PageIdx)
 
 	foundID := ""
 	for _, n := range notes {
@@ -393,7 +395,7 @@ func (r *noteHoverLayerRenderer) Refresh() {
 		return
 	}
 
-	notes := r.layer.viewer.noteStore.GetByPage(r.layer.viewer.currentPage - 1)
+	notes := r.layer.viewer.noteStore.GetByPage(r.layer.PageIdx)
 
 	for _, n := range notes {
 		if n.ID == r.layer.hoveredNoteID {
@@ -514,7 +516,7 @@ func (nl *NoteLayer) showAddNoteDialog(pdfX, pdfY float64) {
 
 		note := PDFNote{
 			ID:        fmt.Sprintf("note_%d", time.Now().UnixNano()),
-			Page:      nl.viewer.currentPage - 1,
+			Page:      nl.PageIdx,
 			PdfX:      pdfX,
 			PdfY:      pdfY,
 			Text:      entry.Text,
@@ -618,7 +620,7 @@ func (r *noteLayerRenderer) Refresh() {
 		return
 	}
 
-	notes := r.layer.viewer.noteStore.GetByPage(r.layer.viewer.currentPage - 1)
+	notes := r.layer.viewer.noteStore.GetByPage(r.layer.PageIdx)
 
 	for _, n := range notes {
 		sx, sy := r.layer.pdfToScreen(n.PdfX, n.PdfY)

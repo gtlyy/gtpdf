@@ -177,6 +177,25 @@ type PDFViewerPlus struct {
 	scrollToBottom bool
 	resizeWatcher  *resizeWatcher
 	contentSplit   *container.Split
+
+	continuousMode     bool
+	continuousBtn      *widget.Button
+	continuousTextLayers []*TextSelectionLayer
+	continuousAnnotLayers     []*AnnotLayer
+	continuousAnnotToolLayers []*AnnotToolLayer
+	continuousNoteLayers      []*NoteLayer
+	continuousNoteHoverLayers []*NoteHoverLayer
+	continuousCtxOverlays      []*contextOverlay
+	pageImages          []*canvas.Image
+	pageStacks          []*fyne.Container
+	pageRendered        []bool
+	pageRendering       []bool
+	pageHeights         []float32
+	pageYOffsets        []float32
+	continuousBuildVer  int32
+	refreshScheduled    bool
+	lastFilled          int
+	filling             bool
 }
 
 type scrollOverlay struct {
@@ -189,6 +208,27 @@ func (s *scrollOverlay) Scrolled(ev *fyne.ScrollEvent) {
 	if v.pdfDoc == nil || v.contentScroll == nil {
 		return
 	}
+
+	scrollSpeed := float32(2.0)
+	dy := ev.Scrolled.DY * scrollSpeed
+
+	if v.continuousMode {
+		ev.Scrolled.DY = dy
+		v.contentScroll.Scrolled(ev)
+
+		detectedPage := v.getCurrentPageFromScroll()
+		if detectedPage != v.currentPage {
+			v.updateContinuousCurrentPage(detectedPage)
+		}
+
+		// Trigger background fill if approaching filled boundary
+		if !v.filling && v.currentPage >= v.lastFilled-10 && v.lastFilled < len(v.pageImages) {
+			v.filling = true
+			go v.fillCacheBackground()
+		}
+		return
+	}
+
 	scroll := v.contentScroll
 	size := scroll.Size()
 	contentSize := scroll.Content.Size()
@@ -200,16 +240,16 @@ func (s *scrollOverlay) Scrolled(ev *fyne.ScrollEvent) {
 
 	// Page fits: need to accumulate "overscroll" before flipping
 	if contentSize.Height <= size.Height {
-		if ev.Scrolled.DY < 0 && v.currentPage < v.totalPages {
-			v.scrollDebt -= ev.Scrolled.DY
+		if dy < 0 && v.currentPage < v.totalPages {
+			v.scrollDebt -= dy
 			if v.scrollDebt > overscrollThreshold {
 				v.scrollDebt = 0
 				v.scrollToBottom = false
 				scroll.Offset = fyne.NewPos(0, 0)
 				v.GoToPagePlus(v.currentPage + 1)
 			}
-		} else if ev.Scrolled.DY > 0 && v.currentPage > 1 {
-			v.scrollDebt += ev.Scrolled.DY
+		} else if dy > 0 && v.currentPage > 1 {
+			v.scrollDebt += dy
 			if v.scrollDebt > overscrollThreshold {
 				v.scrollDebt = 0
 				v.scrollToBottom = true
@@ -223,8 +263,8 @@ func (s *scrollOverlay) Scrolled(ev *fyne.ScrollEvent) {
 
 	// Page taller than viewport
 	if atTop {
-		if ev.Scrolled.DY > 0 && v.currentPage > 1 {
-			v.scrollDebt += ev.Scrolled.DY
+		if dy > 0 && v.currentPage > 1 {
+			v.scrollDebt += dy
 			if v.scrollDebt > overscrollThreshold {
 				v.scrollDebt = 0
 				v.scrollToBottom = true
@@ -235,8 +275,8 @@ func (s *scrollOverlay) Scrolled(ev *fyne.ScrollEvent) {
 		v.scrollDebt = 0
 	}
 	if atBottom {
-		if ev.Scrolled.DY < 0 && v.currentPage < v.totalPages {
-			v.scrollDebt -= ev.Scrolled.DY
+		if dy < 0 && v.currentPage < v.totalPages {
+			v.scrollDebt -= dy
 			if v.scrollDebt > overscrollThreshold {
 				v.scrollDebt = 0
 				v.scrollToBottom = false
@@ -249,7 +289,7 @@ func (s *scrollOverlay) Scrolled(ev *fyne.ScrollEvent) {
 	}
 	v.scrollDebt = 0
 
-	newY := scroll.Offset.Y - ev.Scrolled.DY
+	newY := scroll.Offset.Y - dy
 	if newY+size.Height >= contentSize.Height {
 		newY = contentSize.Height - size.Height
 	}
@@ -274,12 +314,17 @@ func (r *scrollOverlayRenderer) Destroy()                             {}
 
 type contextOverlay struct {
 	widget.BaseWidget
-	viewer      *PDFViewerPlus
-	panDragging bool
-	panStart    fyne.Position
-	panTarget   fyne.Position
-	panTicker   *time.Ticker
-	panStop     chan struct{}
+	viewer         *PDFViewerPlus
+	pageIdx        int
+	textLayer      *TextSelectionLayer
+	annotToolLayer *AnnotToolLayer
+	noteLayer      *NoteLayer
+	noteHoverLayer *NoteHoverLayer
+	panDragging    bool
+	panStart       fyne.Position
+	panTarget      fyne.Position
+	panTicker      *time.Ticker
+	panStop        chan struct{}
 }
 
 func (c *contextOverlay) startPanTicker() {
@@ -325,16 +370,21 @@ func (c *contextOverlay) MouseDown(ev *desktop.MouseEvent) {
 	if ev.Button == desktop.MouseButtonSecondary {
 		return
 	}
-	c.viewer.textLayer.MouseDown(ev)
-	c.viewer.annotToolLayer.MouseDown(ev)
-	c.viewer.noteLayer.MouseDown(ev)
+	if c.textLayer != nil {
+		c.textLayer.MouseDown(ev)
+	}
+	if c.annotToolLayer != nil {
+		c.annotToolLayer.MouseDown(ev)
+	}
+	if c.noteLayer != nil {
+		c.noteLayer.MouseDown(ev)
+	}
 }
 
 func (c *contextOverlay) MouseUp(ev *desktop.MouseEvent) {
 	if c.panDragging {
 		c.panDragging = false
 		c.stopPanTicker()
-		// 确保最后一次偏移被应用
 		c.viewer.contentScroll.Offset = c.panTarget
 		c.viewer.contentScroll.Refresh()
 		return
@@ -342,9 +392,15 @@ func (c *contextOverlay) MouseUp(ev *desktop.MouseEvent) {
 	if ev.Button == desktop.MouseButtonSecondary {
 		return
 	}
-	c.viewer.textLayer.MouseUp(ev)
-	c.viewer.annotToolLayer.MouseUp(ev)
-	c.viewer.noteLayer.MouseUp(ev)
+	if c.textLayer != nil {
+		c.textLayer.MouseUp(ev)
+	}
+	if c.annotToolLayer != nil {
+		c.annotToolLayer.MouseUp(ev)
+	}
+	if c.noteLayer != nil {
+		c.noteLayer.MouseUp(ev)
+	}
 }
 
 func (c *contextOverlay) MouseMoved(ev *desktop.MouseEvent) {
@@ -352,7 +408,6 @@ func (c *contextOverlay) MouseMoved(ev *desktop.MouseEvent) {
 		dx := c.panStart.X - ev.AbsolutePosition.X
 		dy := c.panStart.Y - ev.AbsolutePosition.Y
 		c.panStart = ev.AbsolutePosition
-
 		scroll := c.viewer.contentScroll
 		sz := scroll.Size()
 		cs := scroll.Content.Size()
@@ -365,21 +420,39 @@ func (c *contextOverlay) MouseMoved(ev *desktop.MouseEvent) {
 		c.panTarget = fyne.NewPos(newX, newY)
 		return
 	}
-	c.viewer.textLayer.MouseMoved(ev)
-	c.viewer.annotToolLayer.MouseMoved(ev)
-	c.viewer.noteHoverLayer.MouseMoved(ev)
+	if c.textLayer != nil {
+		c.textLayer.MouseMoved(ev)
+	}
+	if c.annotToolLayer != nil {
+		c.annotToolLayer.MouseMoved(ev)
+	}
+	if c.noteHoverLayer != nil {
+		c.noteHoverLayer.MouseMoved(ev)
+	}
 }
 
 func (c *contextOverlay) MouseIn(ev *desktop.MouseEvent) {
-	c.viewer.textLayer.MouseIn(ev)
-	c.viewer.annotToolLayer.MouseIn(ev)
-	c.viewer.noteHoverLayer.MouseIn(ev)
+	if c.textLayer != nil {
+		c.textLayer.MouseIn(ev)
+	}
+	if c.annotToolLayer != nil {
+		c.annotToolLayer.MouseIn(ev)
+	}
+	if c.noteHoverLayer != nil {
+		c.noteHoverLayer.MouseIn(ev)
+	}
 }
 
 func (c *contextOverlay) MouseOut() {
-	c.viewer.textLayer.MouseOut()
-	c.viewer.annotToolLayer.MouseOut()
-	c.viewer.noteHoverLayer.MouseOut()
+	if c.textLayer != nil {
+		c.textLayer.MouseOut()
+	}
+	if c.annotToolLayer != nil {
+		c.annotToolLayer.MouseOut()
+	}
+	if c.noteHoverLayer != nil {
+		c.noteHoverLayer.MouseOut()
+	}
 }
 
 func (c *contextOverlay) TappedSecondary(ev *fyne.PointEvent) {
@@ -387,15 +460,16 @@ func (c *contextOverlay) TappedSecondary(ev *fyne.PointEvent) {
 	if v.pdfDoc == nil {
 		return
 	}
+	pn := c.pageIdx + 1
 	items := []*fyne.MenuItem{
-		fyne.NewMenuItem("复制本页", func() { v.CopyPageTextPlus() }),
+		fyne.NewMenuItem("复制本页", func() { o := v.currentPage; v.currentPage = pn; v.CopyPageTextPlus(); v.currentPage = o }),
 		fyne.NewMenuItem("全部成图", func() { v.ShowExportDialogPlus() }),
-		fyne.NewMenuItem("本页成图", func() { v.ExportCurrentPagePNGPlus() }),
-		fyne.NewMenuItem("本页扣图", func() { v.ExtractPageImagesPlus() }),
+		fyne.NewMenuItem("本页成图", func() { o := v.currentPage; v.currentPage = pn; v.ExportCurrentPagePNGPlus(); v.currentPage = o }),
+		fyne.NewMenuItem("本页扣图", func() { o := v.currentPage; v.currentPage = pn; v.ExtractPageImagesPlus(); v.currentPage = o }),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("笔记列表", func() { v.ShowNoteList() }),
 		fyne.NewMenuItem("夜间模式", func() { v.ToggleNightModePlus() }),
-		fyne.NewMenuItem("删除本页", func() { v.DeleteCurrentPagePlus() }),
+		fyne.NewMenuItem("删除本页", func() { o := v.currentPage; v.currentPage = pn; v.DeleteCurrentPagePlus(); v.currentPage = o }),
 	}
 	menu := fyne.NewMenu("", items...)
 	popUp := widget.NewPopUpMenu(menu, v.parentWin.Canvas())
@@ -528,8 +602,8 @@ func (v *PDFViewerPlus) initUIPlus() {
 					v.fitWidthBtn.Refresh()
 					v.fitPageBtn.Importance = widget.MediumImportance
 					v.fitPageBtn.Refresh()
-					v.renderCurrentPagePlus()
-				}
+	v.renderCurrentPagePlus()
+}
 				return
 			}
 		}
@@ -680,15 +754,13 @@ func (v *PDFViewerPlus) initUIPlus() {
 		if v.resizeTimer != nil {
 			v.resizeTimer.Stop()
 		}
-		v.resizeTimer = time.NewTimer(300 * time.Millisecond)
-		go func() {
-			<-v.resizeTimer.C
+		v.resizeTimer = time.AfterFunc(300*time.Millisecond, func() {
 			fyne.Do(func() {
 				if v.pdfDoc != nil {
 					v.autoFitPlus()
 				}
 			})
-		}()
+		})
 	}
 	v.resizeWatcher = watcher
 
@@ -714,7 +786,13 @@ func (v *PDFViewerPlus) initUIPlus() {
 
 	v.scrollOverlay = &scrollOverlay{viewer: v}
 	v.scrollOverlay.ExtendBaseWidget(v.scrollOverlay)
-	v.contextOverlay = &contextOverlay{viewer: v}
+	v.contextOverlay = &contextOverlay{
+		viewer:         v,
+		textLayer:      v.textLayer,
+		annotToolLayer: v.annotToolLayer,
+		noteLayer:      v.noteLayer,
+		noteHoverLayer: v.noteHoverLayer,
+	}
 	v.contextOverlay.ExtendBaseWidget(v.contextOverlay)
 	v.thumbVisible = false
 	v.contentArea = container.NewStack(watcher, v.scrollOverlay)
@@ -790,6 +868,15 @@ func (v *PDFViewerPlus) createMergedToolbarPlus() {
 	v.fitPageBtn = fitPageBtn
 	v.fitWidthMode = true
 
+	continuousBtn := widget.NewButton("连续", func() {
+		if v.pdfDoc == nil {
+			return
+		}
+		v.toggleContinuousMode()
+	})
+	v.continuousBtn = continuousBtn
+	v.continuousBtn.Importance = widget.MediumImportance
+
 	thumbBtn := widget.NewButtonWithIcon("缩略", theme.ListIcon(), func() { v.ToggleThumbnailsPlus(); v.autoFitPlus() })
 
 	panBtn := widget.NewButtonWithIcon("平移", theme.GridIcon(), nil)
@@ -832,6 +919,7 @@ func (v *PDFViewerPlus) createMergedToolbarPlus() {
 			v.textLayer.ocrMode = false
 			v.textLayer.ocrImg = nil
 			v.textLayer.ClearSelection()
+			v.clearContinuousTextSelection()
 			v.selectBtn.Importance = widget.MediumImportance
 			v.selectBtn.Refresh()
 			return
@@ -923,6 +1011,7 @@ func (v *PDFViewerPlus) createMergedToolbarPlus() {
 			v.noteBtn.Importance = widget.MediumImportance
 			v.noteBtn.Refresh()
 		}
+		v.syncContinuousAnnotMode()
 	})
 	v.noteBtn.Importance = widget.MediumImportance
 
@@ -959,6 +1048,7 @@ func (v *PDFViewerPlus) createMergedToolbarPlus() {
 		}
 		v.annotToggleBtn.Refresh()
 		v.annotLayer.Refresh()
+		v.syncContinuousAnnotMode()
 		v.parentWin.Canvas().Refresh(v.annotLayer)
 	})
 	v.annotToggleBtn.Importance = widget.MediumImportance
@@ -980,6 +1070,7 @@ func (v *PDFViewerPlus) createMergedToolbarPlus() {
 		newZoomEntryWidgetPlus(v.zoomEntry),  // 缩放输入
 		fitWidthBtn,            // 适应宽度
 		fitPageBtn,             // 适应页面
+		v.continuousBtn,        // 连续滚动
 		widget.NewSeparator(),
 		panBtn,                 // 抓手
 		v.selectBtn,            // 划词
@@ -1118,6 +1209,25 @@ func (v *PDFViewerPlus) askFlattenScanned() {
 			"（将另存为同目录下的 "+filepath.Base(flattenPath)+"）",
 		func(ok bool) {
 			if !ok {
+				v.annotMode = true
+				v.noteMode = false
+				v.noteLayer.SetNoteMode(false)
+				v.noteLayer.Hide()
+				v.noteBtn.Importance = widget.MediumImportance
+				v.noteBtn.Refresh()
+				v.textLayer.selectionEnabled = false
+				v.textLayer.ClearSelection()
+				v.selectBtn.Importance = widget.MediumImportance
+				v.selectBtn.Refresh()
+				v.noteHoverLayer.Hide()
+				v.annotToolLayer.SetAnnotMode(true)
+				v.annotBottomBar.Show()
+				v.annotToolLayer.SetDefaultTool(AnnotToolHighlight)
+				v.annotToggleBtn.Importance = widget.HighImportance
+				v.annotToggleBtn.Refresh()
+				v.annotLayer.Refresh()
+				v.syncContinuousAnnotMode()
+				v.parentWin.Canvas().Refresh(v.annotLayer)
 				return
 			}
 			loadingDlg := dialog.NewCustom("转换中...", "请稍候",
@@ -1229,7 +1339,12 @@ func (v *PDFViewerPlus) GoToPagePlus(page int) {
 	v.pageEntry.SetText(fmt.Sprintf("%d", v.currentPage))
 	v.highlightCurrentPagePlus()
 
-	if v.fitWidthMode {
+	if v.continuousMode {
+		v.updateContinuousCurrentPage(page)
+		pageY := v.getPageYOffset(page - 1)
+		v.contentScroll.Offset = fyne.NewPos(0, pageY)
+		v.contentScroll.Refresh()
+	} else if v.fitWidthMode {
 		v.FitWidthPlus()
 	} else {
 		v.renderCurrentPagePlus()
@@ -1246,6 +1361,26 @@ func (v *PDFViewerPlus) removeSearchHighlightFromContent() {
 	if v.searchHighlight == nil || v.contentScroll == nil || v.contentScroll.Content == nil {
 		return
 	}
+
+	if v.continuousMode {
+		for _, stack := range v.pageStacks {
+			if stack == nil {
+				continue
+			}
+			var newObjs []fyne.CanvasObject
+			for _, obj := range stack.Objects {
+				if obj != v.searchHighlight {
+					newObjs = append(newObjs, obj)
+				}
+			}
+			if len(newObjs) != len(stack.Objects) {
+				stack.Objects = newObjs
+				stack.Refresh()
+			}
+		}
+		return
+	}
+
 	content := v.contentScroll.Content.(*fyne.Container)
 	var newObjs []fyne.CanvasObject
 	for _, obj := range content.Objects {
@@ -1338,6 +1473,27 @@ func (v *PDFViewerPlus) doHighlightCurrentPage() (yPos float32) {
 	}
 	v.searchHighlight.SetMatches(matches)
 
+	if v.continuousMode {
+		v.removeSearchHighlightFromContent()
+		pageIdx := v.currentPage - 1
+		if pageIdx >= 0 && pageIdx < len(v.pageStacks) && v.pageStacks[pageIdx] != nil {
+			stack := v.pageStacks[pageIdx]
+			stack.Objects = append(stack.Objects, v.searchHighlight)
+			stack.Refresh()
+		}
+		// Scroll to highlight position, adjusted by page Y offset
+		pageY := v.getPageYOffset(pageIdx)
+		targetY := matches[0].Y + pageY
+		scrollSize := v.contentScroll.Size()
+		offsetY := targetY - scrollSize.Height/2
+		if offsetY < 0 {
+			offsetY = 0
+		}
+		v.contentScroll.Offset = fyne.NewPos(0, offsetY)
+		v.contentScroll.Refresh()
+		return matches[0].Y
+	}
+
 	if v.contentScroll.Content != nil {
 		content := v.contentScroll.Content.(*fyne.Container)
 		found := false
@@ -1379,7 +1535,9 @@ func (v *PDFViewerPlus) clearSearchHighlight() {
 		return
 	}
 
-	if v.contentScroll.Content != nil {
+	if v.continuousMode {
+		v.removeSearchHighlightFromContent()
+	} else if v.contentScroll.Content != nil {
 		content := v.contentScroll.Content.(*fyne.Container)
 		var newObjs []fyne.CanvasObject
 		for _, obj := range content.Objects {
@@ -1582,6 +1740,10 @@ func (v *PDFViewerPlus) renderCurrentPagePlus() {
 		return
 	}
 
+	if v.continuousMode {
+		v.restorePageMode()
+	}
+
 	if v.currentPage == v.lastRenderPage && v.zoom == v.lastRenderZoom {
 		return
 	}
@@ -1632,6 +1794,10 @@ func (v *PDFViewerPlus) renderCurrentPagePlus() {
 		v.noteHoverLayer.ClearHover()
 		v.annotLayer.pageWidth = page.Width
 		v.annotLayer.pageHeight = page.Height
+		v.annotLayer.PageIdx = pageIdx
+		v.annotToolLayer.PageIdx = pageIdx
+		v.noteLayer.PageIdx = pageIdx
+		v.noteHoverLayer.PageIdx = pageIdx
 		v.annotToolLayer.Refresh()
 		v.annotLayer.Refresh()
 		if v.noteMode {
@@ -1649,6 +1815,7 @@ func (v *PDFViewerPlus) renderCurrentPagePlus() {
 		}
 		v.contentScroll.Refresh()
 		logD("[view] ver=%d page=%d zoom=%.2f cache HIT in %v", ver, v.currentPage, v.zoom, time.Since(t0))
+		v.verifyPageDimensions(pageIdx, cached, canvasScale, curNightMode)
 		return
 	}
 
@@ -1677,6 +1844,10 @@ func (v *PDFViewerPlus) renderCurrentPagePlus() {
 
 	v.annotLayer.pageWidth = page.Width
 	v.annotLayer.pageHeight = page.Height
+	v.annotLayer.PageIdx = pageIdx
+	v.annotToolLayer.PageIdx = pageIdx
+	v.noteLayer.PageIdx = pageIdx
+	v.noteHoverLayer.PageIdx = pageIdx
 
 	v.annotToolLayer.Refresh()
 
@@ -1703,6 +1874,7 @@ func (v *PDFViewerPlus) renderCurrentPagePlus() {
 			v.canvasImg.Image = img
 			v.canvasImg.Refresh()
 			v.contentScroll.Refresh()
+			v.verifyPageDimensions(pageIdx, img, canvasScale, curNightMode)
 			if v.scrollToBottom {
 				v.scrollToBottom = false
 				maxY := nH - float64(v.contentScroll.Size().Height)
@@ -1773,6 +1945,10 @@ func (v *PDFViewerPlus) FitWidthPlus() {
 		return
 	}
 
+	if v.continuousMode {
+		v.restorePageMode()
+	}
+
 	v.fitWidthMode = true
 	v.fitWidthBtn.Importance = widget.HighImportance
 	v.fitWidthBtn.Refresh()
@@ -1801,6 +1977,10 @@ func (v *PDFViewerPlus) FitWidthPlus() {
 func (v *PDFViewerPlus) FitPagePlus() {
 	if v.pdfDoc == nil {
 		return
+	}
+
+	if v.continuousMode {
+		v.restorePageMode()
 	}
 
 	v.fitWidthMode = false
@@ -1834,6 +2014,629 @@ func (v *PDFViewerPlus) FitPagePlus() {
 	v.zoomEntry.SetText(fmt.Sprintf("%.0f%%", v.zoom*100))
 	v.zoomUpdating = false
 	v.renderCurrentPagePlus()
+}
+
+func (v *PDFViewerPlus) clearContinuousTextSelection() {
+	if !v.continuousMode || len(v.continuousTextLayers) == 0 {
+		return
+	}
+	for _, tl := range v.continuousTextLayers {
+		if tl == nil {
+			continue
+		}
+		tl.selectionEnabled = false
+		tl.ocrMode = false
+		tl.ocrImg = nil
+		tl.ClearSelection()
+	}
+}
+
+func (v *PDFViewerPlus) ensureAnnotLayers(pageIdx int) {
+	if pageIdx < 0 || pageIdx >= len(v.continuousAnnotLayers) {
+		return
+	}
+	if v.continuousAnnotLayers[pageIdx] != nil {
+		return
+	}
+	page := v.pdfDoc.GetPagePlus(pageIdx)
+	if page == nil {
+		return
+	}
+	annotLayer := NewAnnotLayer(v)
+	annotLayer.PageIdx = pageIdx
+	annotLayer.pageWidth = page.Width
+	annotLayer.pageHeight = page.Height
+	annotLayer.Show()
+	annotLayer.Refresh()
+
+	annotToolLayer := NewAnnotToolLayer(v, annotLayer)
+	annotToolLayer.PageIdx = pageIdx
+
+	noteLayer := NewNoteLayer(v)
+	noteLayer.PageIdx = pageIdx
+	noteLayer.pageWidth = page.Width
+	noteLayer.pageHeight = page.Height
+	noteLayer.Hide()
+
+	noteHoverLayer := NewNoteHoverLayer(v)
+	noteHoverLayer.PageIdx = pageIdx
+	noteHoverLayer.pageWidth = page.Width
+	noteHoverLayer.pageHeight = page.Height
+	noteHoverLayer.Hide()
+
+	ctxOverlay := &contextOverlay{
+		viewer:         v,
+		pageIdx:        pageIdx,
+		textLayer:      v.continuousTextLayers[pageIdx],
+		annotToolLayer: annotToolLayer,
+		noteLayer:      noteLayer,
+		noteHoverLayer: noteHoverLayer,
+	}
+	ctxOverlay.ExtendBaseWidget(ctxOverlay)
+
+	v.continuousAnnotLayers[pageIdx] = annotLayer
+	v.continuousAnnotToolLayers[pageIdx] = annotToolLayer
+	v.continuousNoteLayers[pageIdx] = noteLayer
+	v.continuousNoteHoverLayers[pageIdx] = noteHoverLayer
+	v.continuousCtxOverlays[pageIdx] = ctxOverlay
+
+	stack := v.pageStacks[pageIdx]
+	if stack != nil {
+		for i := len(stack.Objects) - 1; i >= 0; i-- {
+			stack.Remove(stack.Objects[i])
+		}
+		stack.Add(v.pageImages[pageIdx])
+		stack.Add(annotLayer)
+		stack.Add(v.continuousTextLayers[pageIdx])
+		stack.Add(annotToolLayer)
+		stack.Add(noteLayer)
+		stack.Add(noteHoverLayer)
+		stack.Add(ctxOverlay)
+		stack.Refresh()
+	}
+
+	if v.annotMode {
+		annotToolLayer.Show()
+		annotToolLayer.currentTool = v.annotToolLayer.currentTool
+	} else {
+		annotToolLayer.Hide()
+	}
+}
+
+func (v *PDFViewerPlus) syncContinuousAnnotMode() {
+	if !v.continuousMode {
+		return
+	}
+	synced := 0
+	for i := range v.continuousAnnotToolLayers {
+		if v.continuousTextLayers[i] != nil && v.continuousAnnotLayers[i] == nil {
+			v.ensureAnnotLayers(i)
+		}
+		if atl := v.continuousAnnotToolLayers[i]; atl != nil {
+			synced++
+			if v.annotMode {
+				atl.Show()
+				atl.currentTool = v.annotToolLayer.currentTool
+			} else {
+				atl.Hide()
+			}
+		}
+		if al := v.continuousAnnotLayers[i]; al != nil {
+			if v.annotLayer.Visible() {
+				al.Show()
+			} else {
+				al.Hide()
+			}
+		}
+		if nl := v.continuousNoteLayers[i]; nl != nil {
+			if v.noteMode {
+				nl.Show()
+				nl.SetNoteMode(true)
+			} else {
+				nl.Hide()
+				nl.SetNoteMode(false)
+			}
+		}
+		if nhl := v.continuousNoteHoverLayers[i]; nhl != nil {
+			if v.noteMode {
+				nhl.Show()
+			} else {
+				nhl.Hide()
+			}
+		}
+	}
+}
+
+func (v *PDFViewerPlus) finalizeContinuousLayout() {
+	n := v.pdfDoc.numPages
+
+	// Manual zoom mode: skip scan, just render 3 pages + start background fill
+	if !v.fitWidthMode {
+		count := 0
+		done := make(chan struct{}, 3)
+		for i := 0; i < 3 && i < n; i++ {
+			v.renderContinuousPage(i, done)
+			count++
+		}
+		for i := 0; i < count; i++ {
+			<-done
+		}
+		v.lastFilled = 3
+		v.filling = true
+		go v.fillCacheBackground()
+		return
+	}
+
+	// Fit-width mode: scan all pages for max width via pdfcpu
+	err := func() error {
+		f, err := os.Open(v.filePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		boundaries, err := api.Boxes(f, nil, model.NewDefaultConfiguration())
+		if err != nil {
+			return err
+		}
+		var maxPW float32
+		for _, pb := range boundaries {
+			mb := pb.MediaBox()
+			if mb != nil {
+				w := float32(mb.Width())
+				if w > maxPW {
+					maxPW = w
+				}
+			}
+		}
+		if maxPW <= 0 {
+			return nil
+		}
+
+		fyne.DoAndWait(func() {
+			if !v.continuousMode {
+				return
+			}
+			currentEstW := float32(595)
+			if page := v.pdfDoc.GetPagePlus(v.currentPage - 1); page != nil {
+				currentEstW = float32(page.Width * float64(v.zoom))
+			}
+			fitZoom := currentEstW / maxPW
+			if v.fitWidthMode && fitZoom < v.zoom {
+				v.zoom = fitZoom
+				v.fitWidthMode = true
+				v.pdfDoc.ClearZoomCache()
+				v.buildContinuousContent()
+			}
+		})
+		// Now in goroutine: render first 3 pages and wait for them
+		count := 0
+		done := make(chan struct{}, 3)
+		for i := 0; i < 3 && i < n; i++ {
+			v.renderContinuousPage(i, done)
+			count++
+		}
+		for i := 0; i < count; i++ {
+			<-done
+		}
+		v.lastFilled = 3
+		v.filling = true
+		go v.fillCacheBackground()
+		return nil
+	}()
+
+	if err != nil {
+		// Fallback: PDFium scan in background (no progress dialog since this is simplified)
+		var maxPW float32
+		for i := 0; i < n; i++ {
+			if !v.continuousMode {
+				return
+			}
+			page := v.pdfDoc.GetPagePlus(i)
+			if page != nil {
+				w := float32(page.Width)
+				if w > maxPW {
+					maxPW = w
+				}
+			}
+		}
+		if maxPW <= 0 {
+			return
+		}
+		fyne.DoAndWait(func() {
+			if !v.continuousMode {
+				return
+			}
+			currentEstW := float32(595)
+			if page := v.pdfDoc.GetPagePlus(v.currentPage - 1); page != nil {
+				currentEstW = float32(page.Width * float64(v.zoom))
+			}
+			fitZoom := currentEstW / maxPW
+			if v.fitWidthMode && fitZoom < v.zoom {
+				v.zoom = fitZoom
+				v.fitWidthMode = true
+				v.pdfDoc.ClearZoomCache()
+				v.buildContinuousContent()
+			}
+		})
+		count := 0
+		done := make(chan struct{}, 3)
+		for i := 0; i < 3 && i < n; i++ {
+			v.renderContinuousPage(i, done)
+			count++
+		}
+		for i := 0; i < count; i++ {
+			<-done
+		}
+		v.lastFilled = 3
+		v.filling = true
+		go v.fillCacheBackground()
+	}
+}
+
+func (v *PDFViewerPlus) fillCacheBackground() {
+	defer func() { v.filling = false }()
+	n := len(v.pageImages)
+	target := v.lastFilled + 27 // Fill next 27 pages (3→30, 30→57, etc.)
+	if target > n {
+		target = n
+	}
+	for batchStart := v.lastFilled; batchStart < target; batchStart += 3 {
+		if !v.continuousMode {
+			return
+		}
+		count := 0
+		done := make(chan struct{}, 3)
+		for i := batchStart; i < batchStart+3 && i < target; i++ {
+			if v.continuousMode {
+				v.renderContinuousPage(i, done)
+				count++
+			}
+		}
+		for i := 0; i < count; i++ {
+			<-done
+		}
+	}
+	v.lastFilled = target
+}
+
+func (v *PDFViewerPlus) toggleContinuousMode() {
+	if v.pdfDoc == nil {
+		return
+	}
+	v.continuousMode = !v.continuousMode
+	v.lastFilled = 0
+	if v.continuousMode {
+		v.buildContinuousContent()
+		go v.finalizeContinuousLayout()
+	} else {
+		v.restorePageMode()
+	}
+	if v.continuousMode {
+		v.continuousBtn.Importance = widget.HighImportance
+	} else {
+		v.continuousBtn.Importance = widget.MediumImportance
+	}
+	v.continuousBtn.Refresh()
+}
+
+func (v *PDFViewerPlus) buildContinuousContent() {
+	atomic.AddInt32(&v.continuousBuildVer, 1)
+	n := v.pdfDoc.numPages
+	v.pageImages = make([]*canvas.Image, n)
+	v.pageStacks = make([]*fyne.Container, n)
+	v.pageRendered = make([]bool, n)
+	v.pageRendering = make([]bool, n)
+	v.continuousTextLayers = make([]*TextSelectionLayer, n)
+	v.continuousAnnotLayers = make([]*AnnotLayer, n)
+	v.continuousAnnotToolLayers = make([]*AnnotToolLayer, n)
+	v.continuousNoteLayers = make([]*NoteLayer, n)
+	v.continuousNoteHoverLayers = make([]*NoteHoverLayer, n)
+	v.continuousCtxOverlays = make([]*contextOverlay, n)
+	v.pageHeights = make([]float32, n)
+	v.pageYOffsets = make([]float32, n)
+
+	// Use current page dimensions as estimate for all pages
+	var estW, estH float32 = 595, 842
+	if page := v.pdfDoc.GetPagePlus(v.currentPage - 1); page != nil {
+		estW = float32(page.Width * float64(v.zoom))
+		estH = float32(page.Height * float64(v.zoom))
+	}
+
+	var yOffset float32
+	for i := 0; i < n; i++ {
+		v.pageYOffsets[i] = yOffset
+		v.pageHeights[i] = estH
+		yOffset += estH + 4
+
+		img := canvas.NewImageFromImage(nil)
+		img.FillMode = canvas.ImageFillOriginal
+		img.SetMinSize(fyne.NewSize(estW, estH))
+		v.pageImages[i] = img
+
+		stack := container.NewStack(img)
+		v.pageStacks[i] = stack
+	}
+
+	// Build VBox with separators
+	var objs []fyne.CanvasObject
+	for _, s := range v.pageStacks {
+		if len(objs) > 0 {
+			sep := canvas.NewRectangle(color.NRGBA{0, 0, 0, 25})
+			sep.SetMinSize(fyne.NewSize(1, 4))
+			objs = append(objs, sep)
+		}
+		objs = append(objs, s)
+	}
+	v.contentScroll.Content = container.NewVBox(objs...)
+	v.contentScroll.Refresh()
+
+	// Ensure text layers for ±1 pages
+	for di := -1; di <= 1; di++ {
+		idx := v.currentPage - 1 + di
+		if idx >= 0 && idx < n {
+			v.ensureTextLayer(idx)
+		}
+	}
+
+	// Scroll to current page position
+	pageY := v.getPageYOffset(v.currentPage - 1)
+	v.contentScroll.Offset = fyne.NewPos(0, pageY)
+	v.contentScroll.Refresh()
+}
+
+func (v *PDFViewerPlus) ensureTextLayer(pageIdx int) *TextSelectionLayer {
+	if pageIdx < 0 || pageIdx >= len(v.continuousTextLayers) {
+		return nil
+	}
+	if v.continuousTextLayers[pageIdx] != nil {
+		return v.continuousTextLayers[pageIdx]
+	}
+
+	textLayer := NewTextSelectionLayer(v)
+	textLayer.PageIdx = pageIdx
+	page := v.pdfDoc.GetPagePlus(pageIdx)
+	if page != nil {
+		textLayer.pageWidth = page.Width
+		textLayer.pageHeight = page.Height
+	}
+
+	v.continuousTextLayers[pageIdx] = textLayer
+
+	stack := v.pageStacks[pageIdx]
+	if stack != nil {
+		stack.Add(textLayer)
+		stack.Refresh()
+	}
+
+	return textLayer
+}
+
+func (v *PDFViewerPlus) restorePageMode() {
+	v.pageImages = nil
+	v.pageStacks = nil
+	v.pageRendered = nil
+	v.pageRendering = nil
+	v.continuousTextLayers = nil
+	v.continuousAnnotLayers = nil
+	v.continuousAnnotToolLayers = nil
+	v.continuousNoteLayers = nil
+	v.continuousNoteHoverLayers = nil
+	v.continuousCtxOverlays = nil
+	v.pageHeights = nil
+	v.pageYOffsets = nil
+	v.continuousMode = false
+
+	v.lastRenderPage = -1
+	v.lastRenderZoom = -1
+
+	if v.canvasImg == nil {
+		v.canvasImg = canvas.NewImageFromImage(nil)
+		v.canvasImg.FillMode = canvas.ImageFillOriginal
+	}
+	v.clearSearchHighlight()
+	contentContainer := container.NewStack(v.canvasImg, v.annotLayer, v.textLayer, v.annotToolLayer, v.noteLayer, v.noteHoverLayer, v.contextOverlay)
+	v.contentScroll.Content = contentContainer
+	v.contentScroll.Offset = fyne.NewPos(0, 0)
+	v.contentScroll.Refresh()
+
+	v.continuousBtn.Importance = widget.MediumImportance
+	v.continuousBtn.Refresh()
+
+	v.renderCurrentPagePlus()
+}
+
+func (v *PDFViewerPlus) scheduleRefresh() {
+	if v.refreshScheduled {
+		return
+	}
+	v.refreshScheduled = true
+	fyne.Do(func() {
+		v.refreshScheduled = false
+		if v.contentScroll != nil {
+			v.contentScroll.Refresh()
+		}
+	})
+}
+
+func (v *PDFViewerPlus) renderContinuousPage(pageIdx int, done ...chan<- struct{}) {
+	if pageIdx < 0 || pageIdx >= len(v.pageImages) || v.pageImages[pageIdx] == nil {
+		return
+	}
+	if v.pageRendered[pageIdx] {
+		return
+	}
+	if v.pageRendering[pageIdx] {
+		return
+	}
+
+	canvasScale := v.parentWin.Canvas().Scale()
+	curNightMode := v.nightMode
+
+	dpi := 72.0 * float64(v.zoom) * float64(canvasScale)
+	roundedDPI := int(math.Round(dpi))
+	cacheKey := zoomCacheKeyPlus{page: pageIdx, dpi: roundedDPI, nightMode: curNightMode}
+
+	v.pdfDoc.zoomMu.Lock()
+	cached, cachedOK := v.pdfDoc.zoomCache[cacheKey]
+	v.pdfDoc.zoomMu.Unlock()
+
+	if cachedOK && cached != nil {
+		// Cache HIT: dispatch to main goroutine (Fyne APIs)
+		fyne.Do(func() {
+			if page := v.pdfDoc.GetPagePlus(pageIdx); page != nil {
+				w := float32(page.Width * float64(v.zoom))
+				h := float32(page.Height * float64(v.zoom))
+				v.updatePageLayout(pageIdx, w, h)
+			}
+			v.pageImages[pageIdx].Image = cached
+			v.pageImages[pageIdx].Refresh()
+			v.pageRendered[pageIdx] = true
+			v.scheduleRefresh()
+			v.verifyPageDimensions(pageIdx, cached, canvasScale, curNightMode)
+			if len(done) > 0 {
+				done[0] <- struct{}{}
+			}
+		})
+		return
+	}
+
+	// Cache MISS: async render via goroutine
+	buildVer := atomic.LoadInt32(&v.continuousBuildVer)
+	v.pageRendering[pageIdx] = true
+	go func() {
+		img, err := v.pdfDoc.RenderPagePlus(pageIdx, v.zoom, canvasScale, curNightMode)
+		if err != nil || img == nil {
+			v.pageRendering[pageIdx] = false
+			if len(done) > 0 {
+				done[0] <- struct{}{}
+			}
+			return
+		}
+		fyne.Do(func() {
+			if atomic.LoadInt32(&v.continuousBuildVer) != buildVer {
+				v.pageRendering[pageIdx] = false
+				if len(done) > 0 {
+					done[0] <- struct{}{}
+				}
+				return
+			}
+			if pageIdx >= len(v.pageImages) || v.pageImages[pageIdx] == nil {
+				if len(done) > 0 {
+					done[0] <- struct{}{}
+				}
+				return
+			}
+			if pg := v.pdfDoc.GetPagePlus(pageIdx); pg != nil {
+				w := float32(pg.Width * float64(v.zoom))
+				h := float32(pg.Height * float64(v.zoom))
+				v.updatePageLayout(pageIdx, w, h)
+			}
+			v.pageImages[pageIdx].Image = img
+			v.pageImages[pageIdx].Refresh()
+			v.pageRendering[pageIdx] = false
+			v.pageRendered[pageIdx] = true
+			v.scheduleRefresh()
+			v.verifyPageDimensions(pageIdx, img, canvasScale, curNightMode)
+			if len(done) > 0 {
+				done[0] <- struct{}{}
+			}
+		})
+	}()
+}
+
+func (v *PDFViewerPlus) verifyPageDimensions(pageIdx int, img image.Image, canvasScale float32, curNightMode bool) {
+	page := v.pdfDoc.GetPagePlus(pageIdx)
+	if page == nil || !page.Loaded {
+		return
+	}
+	expectedLogicalW := page.Width * float64(v.zoom)
+	actualLogicalW := float64(img.Bounds().Dx()) / float64(canvasScale)
+
+	if expectedLogicalW > 0 && actualLogicalW > 0 {
+		ratio := actualLogicalW / expectedLogicalW
+		if ratio < 0.95 || ratio > 1.05 {
+			v.pdfDoc.InvalidateDimensions(pageIdx)
+			if v.continuousMode {
+				// DPI same → cache HIT → re-render ineffective, skip
+			} else {
+				v.lastRenderPage = -1
+				v.lastRenderZoom = -1
+				if v.fitWidthMode {
+					v.FitWidthPlus()
+				} else {
+					v.renderCurrentPagePlus()
+				}
+			}
+		}
+	}
+}
+
+func (v *PDFViewerPlus) updatePageLayout(pageIdx int, w, h float32) {
+	if pageIdx < 0 || pageIdx >= len(v.pageHeights) {
+		return
+	}
+	oldH := v.pageHeights[pageIdx]
+	if oldH == h {
+		return
+	}
+	delta := h - oldH
+	v.pageHeights[pageIdx] = h
+	v.pageImages[pageIdx].SetMinSize(fyne.NewSize(w, h))
+	for i := pageIdx + 1; i < len(v.pageYOffsets); i++ {
+		v.pageYOffsets[i] += delta
+	}
+}
+
+func (v *PDFViewerPlus) getPageYOffset(pageIdx int) float32 {
+	if pageIdx >= 0 && pageIdx < len(v.pageYOffsets) {
+		return v.pageYOffsets[pageIdx]
+	}
+	return 0
+}
+
+func (v *PDFViewerPlus) getCurrentPageFromScroll() int {
+	if v.pdfDoc == nil || v.contentScroll == nil || len(v.pageHeights) == 0 {
+		return v.currentPage
+	}
+	scroll := v.contentScroll
+	viewportCenter := scroll.Offset.Y + scroll.Size().Height/2
+
+	// Binary search for the page containing viewportCenter
+	lo, hi := 0, len(v.pageYOffsets)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if v.pageYOffsets[mid] <= viewportCenter {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	pageIdx := lo - 1
+	if pageIdx < 0 {
+		pageIdx = 0
+	}
+	if pageIdx >= len(v.pageHeights) {
+		pageIdx = len(v.pageHeights) - 1
+	}
+	return pageIdx + 1
+}
+
+func (v *PDFViewerPlus) updateContinuousCurrentPage(newPage int) {
+	if !v.continuousMode || v.currentPage == newPage {
+		return
+	}
+	v.currentPage = newPage
+	v.pageEntry.SetText(fmt.Sprintf("%d", v.currentPage))
+	v.highlightCurrentPagePlus()
+	v.scrollThumbnailsToPagePlus(newPage)
+
+	idx := newPage - 1
+	if idx > 0 {
+		v.renderContinuousPage(idx - 1)
+	}
+	if idx < len(v.pageImages)-1 {
+		v.renderContinuousPage(idx + 1)
+	}
 }
 
 func (v *PDFViewerPlus) autoFitPlus() {
@@ -1985,11 +2788,23 @@ func (v *PDFViewerPlus) enableOCRSelection() {
 	}
 	defer cleanup()
 
-	v.textLayer.SetOCRMode(img, ocrDPI)
-
-	v.textLayer.selectionEnabled = !v.textLayer.selectionEnabled
-	v.textLayer.hitBoxes = nil
-	v.textLayer.hitBoxesPage = -1
+	if v.continuousMode {
+		targetIdx := v.currentPage - 1
+		tl := v.ensureTextLayer(targetIdx)
+		if tl != nil {
+			tl.SetOCRMode(img, ocrDPI)
+			tl.selectionEnabled = true
+			tl.hitBoxes = nil
+			tl.hitBoxesPage = -1
+		}
+		v.textLayer.SetOCRMode(img, ocrDPI)
+		v.textLayer.selectionEnabled = true
+	} else {
+		v.textLayer.SetOCRMode(img, ocrDPI)
+		v.textLayer.selectionEnabled = !v.textLayer.selectionEnabled
+		v.textLayer.hitBoxes = nil
+		v.textLayer.hitBoxesPage = -1
+	}
 
 	if v.textLayer.selectionEnabled {
 		v.selectBtn.Importance = widget.HighImportance
@@ -2369,6 +3184,21 @@ func (v *PDFViewerPlus) CloseFilePlus() {
 	v.annotMode = false
 	v.noteStore = NewNoteStore()
 	v.dirty = false
+	v.continuousMode = false
+	v.continuousBtn.Importance = widget.MediumImportance
+	v.continuousBtn.Refresh()
+	v.pageImages = nil
+	v.pageStacks = nil
+	v.pageRendered = nil
+	v.pageRendering = nil
+	v.continuousTextLayers = nil
+	v.continuousAnnotLayers = nil
+	v.continuousAnnotToolLayers = nil
+	v.continuousNoteLayers = nil
+	v.continuousNoteHoverLayers = nil
+	v.continuousCtxOverlays = nil
+	v.pageHeights = nil
+	v.pageYOffsets = nil
 
 	v.canvasImg = nil
 	v.thumbCache = make(map[int]image.Image)

@@ -21,20 +21,12 @@ func Init() bool {
 	}
 
 	pid := os.Getpid()
-	exe, err := os.Executable()
-	if err != nil {
-		return false
-	}
-	dir := filepath.Join(filepath.Dir(exe), fmt.Sprintf("gtpdf_%d", pid))
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("gtpdf_%d", pid))
+	os.MkdirAll(dir, 0755)
 	soPath := filepath.Join(dir, "libpdfium.so")
 
-	if err := os.MkdirAll(dir, 0755); err != nil || os.WriteFile(soPath, data, 0755) != nil {
-		dir = filepath.Join(os.TempDir(), fmt.Sprintf("gtpdf_%d", pid))
-		os.MkdirAll(dir, 0755)
-		soPath = filepath.Join(dir, "libpdfium.so")
-		if err := os.WriteFile(soPath, data, 0755); err != nil {
-			return false
-		}
+	if err := os.WriteFile(soPath, data, 0755); err != nil {
+		return false
 	}
 
 	if !loadLibrary(soPath) {

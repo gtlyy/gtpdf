@@ -8,7 +8,7 @@ import (
 
 func createAboutTab(win fyne.Window) *container.TabItem {
 	content := container.NewVBox()
-	content.Add(widget.NewLabelWithStyle("GtPDF V1.8.1", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}))
+	content.Add(widget.NewLabelWithStyle("GtPDF V1.9", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}))
 
 	authorLabel := widget.NewLabel("作者: gtlyy")
 	content.Add(authorLabel)

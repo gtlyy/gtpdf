@@ -101,7 +101,7 @@ func main() {
 
 	showMainWindow(mainWindow, filePath)
 
-	mainWindow.Resize(fyne.NewSize(1080, 720))
+	mainWindow.Resize(fyne.NewSize(1122, 730))
 	mainWindow.ShowAndRun()
 }
 

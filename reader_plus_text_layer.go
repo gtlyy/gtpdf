@@ -31,6 +31,7 @@ type CharHitBox struct {
 type TextSelectionLayer struct {
 	widget.BaseWidget
 	pdfViewer        *PDFViewerPlus
+	PageIdx          int  // per-page instance: 0-based page index; global instance: -1
 	selRect          *canvas.Rectangle
 	hiPool           []*canvas.Rectangle
 	hiCount          int
@@ -57,11 +58,42 @@ type TextSelectionLayer struct {
 func NewTextSelectionLayer(viewer *PDFViewerPlus) *TextSelectionLayer {
 	layer := &TextSelectionLayer{
 		pdfViewer:        viewer,
+		PageIdx:          -1,
 		selectionEnabled: false,
 		hiCount:          0,
 	}
 	layer.ExtendBaseWidget(layer)
 	return layer
+}
+
+func (t *TextSelectionLayer) getPageIdx() int {
+	if t.PageIdx >= 0 {
+		return t.PageIdx
+	}
+	if t.pdfViewer != nil {
+		return t.pdfViewer.currentPage - 1
+	}
+	return 0
+}
+
+func (t *TextSelectionLayer) effectiveSelectionEnabled() bool {
+	if t.selectionEnabled {
+		return true
+	}
+	if t.pdfViewer != nil && t.pdfViewer.textLayer != nil && t.pdfViewer.textLayer.selectionEnabled {
+		return true
+	}
+	return false
+}
+
+func (t *TextSelectionLayer) getCopyCallback() func(string) {
+	if t.copyCallback != nil {
+		return t.copyCallback
+	}
+	if t.pdfViewer != nil && t.pdfViewer.textLayer != nil {
+		return t.pdfViewer.textLayer.copyCallback
+	}
+	return nil
 }
 
 func (t *TextSelectionLayer) BuildHitBoxes() {
@@ -70,17 +102,18 @@ func (t *TextSelectionLayer) BuildHitBoxes() {
 		return
 	}
 
-	currentPage := t.pdfViewer.currentPage
-	if currentPage < 1 || currentPage > t.pdfViewer.totalPages {
+	pageIdx := t.getPageIdx()
+	pageNum1 := pageIdx + 1
+	if pageNum1 < 1 || pageNum1 > t.pdfViewer.totalPages {
 		t.hitBoxes = nil
 		return
 	}
 
-	if t.hitBoxesPage == currentPage && t.hitBoxesZoom == t.pdfViewer.zoom && t.hitBoxes != nil {
+	if t.hitBoxesPage == pageNum1 && t.hitBoxesZoom == t.pdfViewer.zoom && t.hitBoxes != nil {
 		return
 	}
 
-	page := t.pdfViewer.pdfDoc.GetPagePlus(currentPage - 1)
+	page := t.pdfViewer.pdfDoc.GetPagePlus(pageIdx)
 	if page == nil {
 		t.hitBoxes = nil
 		return
@@ -89,7 +122,7 @@ func (t *TextSelectionLayer) BuildHitBoxes() {
 	t.pageWidth = page.Width
 	t.pageHeight = page.Height
 
-	pageText, err := t.pdfViewer.pdfDoc.GetPageText(currentPage - 1)
+	pageText, err := t.pdfViewer.pdfDoc.GetPageText(pageIdx)
 	if err != nil || pageText.PageWidth <= 0 {
 		t.hitBoxes = nil
 		return
@@ -117,7 +150,7 @@ func (t *TextSelectionLayer) BuildHitBoxes() {
 	}
 
 	t.hitBoxes = boxes
-	t.hitBoxesPage = currentPage
+	t.hitBoxesPage = pageNum1
 	t.hitBoxesZoom = t.pdfViewer.zoom
 }
 
@@ -168,7 +201,7 @@ func (t *TextSelectionLayer) MouseIn(ev *desktop.MouseEvent)  {}
 func (t *TextSelectionLayer) MouseOut()                       {}
 
 func (t *TextSelectionLayer) MouseDown(ev *desktop.MouseEvent) {
-	if !t.selectionEnabled || t.pdfViewer == nil || t.pdfViewer.pdfDoc == nil {
+	if t.pdfViewer == nil || t.pdfViewer.pdfDoc == nil || !t.effectiveSelectionEnabled() {
 		return
 	}
 	if t.ocrMode && t.ocrImg == nil {
@@ -202,7 +235,10 @@ func (t *TextSelectionLayer) MouseUp(ev *desktop.MouseEvent) {
 }
 
 func (t *TextSelectionLayer) MouseMoved(ev *desktop.MouseEvent) {
-	if !t.isDragging || !t.selectionEnabled || t.pdfViewer == nil || t.pdfViewer.pdfDoc == nil {
+	if !t.isDragging {
+		return
+	}
+	if t.pdfViewer == nil || t.pdfViewer.pdfDoc == nil || !t.effectiveSelectionEnabled() {
 		return
 	}
 	if t.ocrMode && t.ocrImg == nil {
@@ -222,7 +258,7 @@ func (r *textSelectionRenderer) Layout(size fyne.Size) {}
 
 func (r *textSelectionRenderer) MinSize() fyne.Size {
 	if r.layer.pdfViewer != nil && r.layer.pdfViewer.pdfDoc != nil {
-		page := r.layer.pdfViewer.pdfDoc.GetPagePlus(r.layer.pdfViewer.currentPage - 1)
+		page := r.layer.pdfViewer.pdfDoc.GetPagePlus(r.layer.getPageIdx())
 		if page != nil {
 			zoom := float64(r.layer.pdfViewer.zoom)
 			return fyne.NewSize(float32(page.Width*zoom), float32(page.Height*zoom))
@@ -378,8 +414,7 @@ func (t *TextSelectionLayer) extractText(selMinX, selMinY, selMaxX, selMaxY floa
 	top := math.Max(pdfY1, pdfY2)
 	bottom := math.Min(pdfY1, pdfY2)
 
-	currentPage := t.pdfViewer.currentPage
-	text, err := t.pdfViewer.pdfDoc.doc.GetBoundedText(currentPage-1, left, top, right, bottom)
+	text, err := t.pdfViewer.pdfDoc.doc.GetBoundedText(t.getPageIdx(), left, top, right, bottom)
 	if err != nil {
 		t.selectedText = ""
 		return
@@ -387,8 +422,10 @@ func (t *TextSelectionLayer) extractText(selMinX, selMinY, selMaxX, selMaxY floa
 
 	t.selectedText = text
 
-	if t.selectedText != "" && t.copyCallback != nil {
-		t.copyCallback(t.selectedText)
+	if t.selectedText != "" {
+		if cb := t.getCopyCallback(); cb != nil {
+			cb(t.selectedText)
+		}
 	}
 }
 
@@ -435,7 +472,7 @@ func (t *TextSelectionLayer) extractTextOCR(selMinX, selMinY, selMaxX, selMaxY f
 		return
 	}
 
-	page := t.pdfViewer.pdfDoc.GetPagePlus(t.pdfViewer.currentPage - 1)
+	page := t.pdfViewer.pdfDoc.GetPagePlus(t.getPageIdx())
 	if page == nil {
 		t.selectedText = ""
 		return
@@ -489,8 +526,10 @@ func (t *TextSelectionLayer) extractTextOCR(selMinX, selMinY, selMaxX, selMaxY f
 
 	t.selectedText = text
 
-	if t.copyCallback != nil {
-		t.copyCallback(t.selectedText)
+	if t.selectedText != "" {
+		if cb := t.getCopyCallback(); cb != nil {
+			cb(t.selectedText)
+		}
 	}
 }
 

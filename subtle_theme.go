@@ -18,7 +18,7 @@ func newSubtleTheme() fyne.Theme {
 func (t *subtleTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
 	switch name {
 	case theme.ColorNameScrollBar:
-		return color.NRGBA{R: 180, G: 180, B: 180, A: 66}
+		return color.NRGBA{R: 160, G: 160, B: 160, A: 140}
 	default:
 		return t.Theme.Color(name, variant)
 	}
@@ -26,7 +26,7 @@ func (t *subtleTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant)
 
 func (t *subtleTheme) Size(name fyne.ThemeSizeName) float32 {
 	if name == theme.SizeNameScrollBar {
-		return 4
+		return 7
 	}
 	return t.Theme.Size(name)
 }

@@ -302,6 +302,7 @@ type AnnotLayer struct {
 	widget.BaseWidget
 	viewer      *PDFViewerPlus
 	toolLayer   *AnnotToolLayer
+	PageIdx     int
 	pageWidth   float64
 	pageHeight  float64
 	imgOffX     float32
@@ -368,6 +369,7 @@ type AnnotToolLayer struct {
 	widget.BaseWidget
 	viewer        *PDFViewerPlus
 	annotLayer    *AnnotLayer
+	PageIdx       int
 	toolBtns      map[AnnotTool]*widget.Button
 	currentTool   AnnotTool
 	annotToolbar  *fyne.Container
@@ -416,17 +418,18 @@ func (atl *AnnotToolLayer) createToolbar() {
 		if atl.viewer.pdfDoc == nil {
 			return
 		}
-		if atl.viewer.annotLayer.Visible() {
-			atl.viewer.annotLayer.Hide()
+		if atl.annotLayer.Visible() {
+			atl.annotLayer.Hide()
 			visBtn.SetText("显示")
 			visBtn.SetIcon(theme.VisibilityOffIcon())
 		} else {
-			atl.viewer.annotLayer.Show()
+			atl.annotLayer.Show()
 			visBtn.SetText("隐藏")
 			visBtn.SetIcon(theme.VisibilityIcon())
 		}
 		visBtn.Refresh()
-		atl.viewer.parentWin.Canvas().Refresh(atl.viewer.annotLayer)
+		atl.viewer.parentWin.Canvas().Refresh(atl.annotLayer)
+		atl.viewer.syncContinuousAnnotMode()
 	}
 	btns = append(btns, visBtn)
 
@@ -571,6 +574,11 @@ func (atl *AnnotToolLayer) MouseDown(ev *desktop.MouseEvent) {
 		return
 	}
 
+	// Per-page layers: always sync tool from global layer
+	if atl.PageIdx >= 0 && atl.viewer.annotToolLayer != atl {
+		atl.currentTool = atl.viewer.annotToolLayer.currentTool
+	}
+
 	if atl.currentTool == "" {
 		atl.editClicked(ev)
 		return
@@ -620,7 +628,7 @@ func (atl *AnnotToolLayer) MouseUp(ev *desktop.MouseEvent) {
 		dx := float32(endIX - startIX)
 		dy := float32(-(endIY - startIY))
 		if abs32(float32(endIX-startIX)) >= 1 || abs32(float32(endIY-startIY)) >= 1 {
-			pageIdx := atl.viewer.currentPage - 1
+			pageIdx := atl.PageIdx
 			atl.viewer.pdfDoc.AnnotMoveFreeText(pageIdx, idx, dx, dy)
 			atl.viewer.markDirty()
 		}
@@ -639,9 +647,9 @@ func (atl *AnnotToolLayer) MouseUp(ev *desktop.MouseEvent) {
 	} else {
 		atl.createShapeAnnot()
 	}
-	atl.viewer.annotLayer.Refresh()
-	atl.viewer.parentWin.Canvas().Refresh(atl.viewer.annotLayer)
-	atl.viewer.annotToolLayer.Refresh()
+	atl.annotLayer.Refresh()
+	atl.viewer.parentWin.Canvas().Refresh(atl.annotLayer)
+	atl.Refresh()
 	canvas.Refresh(atl)
 }
 
@@ -745,7 +753,7 @@ func (atl *AnnotToolLayer) freeTextClicked(ev *desktop.MouseEvent) {
 }
 
 func (atl *AnnotToolLayer) createFreeTextAt(pdfX, pdfY float64, text string, verticalLayout bool, _, fontSize, fgName string) {
-	pageIdx := atl.viewer.currentPage - 1
+	pageIdx := atl.PageIdx
 
 	sizeNum, _ := strconvToFloat(fontSize)
 	if sizeNum <= 0 {
@@ -875,8 +883,8 @@ func (atl *AnnotToolLayer) createFreeTextAt(pdfX, pdfY float64, text string, ver
 			return
 		}
 		atl.viewer.markDirty()
-		atl.viewer.annotLayer.Refresh()
-		atl.viewer.parentWin.Canvas().Refresh(atl.viewer.annotLayer)
+		atl.annotLayer.Refresh()
+		atl.viewer.parentWin.Canvas().Refresh(atl.annotLayer)
 		return
 	}
 
@@ -912,7 +920,7 @@ func (atl *AnnotToolLayer) editClicked(ev *desktop.MouseEvent) {
 	if atl.annotLayer.imgW <= 0 || atl.annotLayer.imgH <= 0 {
 		return
 	}
-	pageIdx := atl.viewer.currentPage - 1
+	pageIdx := atl.PageIdx
 	for i, a := range atl.annotLayer.annotations {
 		l, t1 := atl.annotLayer.pdfToScreen(a.Rect.Left, atl.annotLayer.pageHeight-a.Rect.Top)
 		r, b1 := atl.annotLayer.pdfToScreen(a.Rect.Right, atl.annotLayer.pageHeight-a.Rect.Bottom)
@@ -1065,7 +1073,7 @@ func (atl *AnnotToolLayer) eraseClicked(ev *desktop.MouseEvent) {
 	if atl.annotLayer.imgW <= 0 || atl.annotLayer.imgH <= 0 {
 		return
 	}
-	pageIdx := atl.viewer.currentPage - 1
+	pageIdx := atl.PageIdx
 	count, err := atl.viewer.pdfDoc.AnnotGetCount(pageIdx)
 	if err != nil {
 		return
@@ -1138,7 +1146,7 @@ func (atl *AnnotToolLayer) createTextMarkup() {
 		minY, maxY = maxY, minY
 	}
 
-	pageIdx := atl.viewer.currentPage - 1
+	pageIdx := atl.PageIdx
 	zoom := float32(atl.viewer.zoom)
 	hitBoxes := atl.viewer.textLayer.GetHitBoxesForRange(
 		float32(minX)*zoom, float32(minY)*zoom, float32(maxX)*zoom, float32(maxY)*zoom,
@@ -1242,7 +1250,7 @@ func (atl *AnnotToolLayer) createShapeAnnot() {
 		return
 	}
 
-	pageIdx := atl.viewer.currentPage - 1
+	pageIdx := atl.PageIdx
 	settings := atl.viewer.annotSettings[atl.currentTool]
 	if atl.currentTool == AnnotToolFill {
 		if err := atl.viewer.pdfDoc.CreateFillAnnot(pageIdx,
@@ -1289,7 +1297,7 @@ func (r *annotLayerRenderer) Refresh() {
 	if r.layer.imgW <= 0 || r.layer.imgH <= 0 {
 		return
 	}
-	pageIdx := r.layer.viewer.currentPage - 1
+	pageIdx := r.layer.PageIdx
 	annots, err := r.layer.viewer.pdfDoc.GetAnnotations(pageIdx)
 	if err == nil {
 		for i := range annots {
