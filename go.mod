@@ -6,6 +6,7 @@ require (
 	fyne.io/fyne/v2 v2.7.3
 	github.com/klippa-app/go-pdfium v1.19.2
 	github.com/pdfcpu/pdfcpu v0.11.1
+	golang.org/x/image v0.32.0
 )
 
 require (
@@ -52,7 +53,6 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/yuin/goldmark v1.7.8 // indirect
 	golang.org/x/crypto v0.50.0 // indirect
-	golang.org/x/image v0.32.0 // indirect
 	golang.org/x/net v0.53.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.36.0 // indirect

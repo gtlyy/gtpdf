@@ -7,10 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
 )
 
 // --- main.go ---
@@ -304,4 +307,227 @@ func TestLoadNotesForFile(t *testing.T) {
 	if len(all) != 1 || all[0].ID != "n1" || all[0].Text != "hello" {
 		t.Errorf("loaded notes = %+v", all)
 	}
+}
+
+// --- reader_windows_plus.go: updatePageLayout ---
+
+func TestUpdatePageLayout(t *testing.T) {
+	v := &PDFViewerPlus{
+		pageHeights:  []float32{100, 100, 100, 100},
+		pageYOffsets: []float32{0, 100, 200, 300},
+		pageImages:   make([]*canvas.Image, 4),
+	}
+	for i := range v.pageImages {
+		v.pageImages[i] = canvas.NewImageFromImage(nil)
+		v.pageImages[i].SetMinSize(fyne.NewSize(50, 100))
+	}
+
+	// 改第2页（idx=1）高度 100→150，delta=+50
+	v.updatePageLayout(1, 50, 150)
+
+	if v.pageHeights[1] != 150 {
+		t.Errorf("pageHeights[1] = %v, want 150", v.pageHeights[1])
+	}
+	if v.pageYOffsets[2] != 250 {
+		t.Errorf("pageYOffsets[2] = %v, want 250", v.pageYOffsets[2])
+	}
+	if v.pageYOffsets[3] != 350 {
+		t.Errorf("pageYOffsets[3] = %v, want 350", v.pageYOffsets[3])
+	}
+	// pageYOffsets[0], [1] 不应变
+	if v.pageYOffsets[0] != 0 || v.pageYOffsets[1] != 100 {
+		t.Errorf("first two YOffsets should be unchanged: got [%v, %v]", v.pageYOffsets[0], v.pageYOffsets[1])
+	}
+}
+
+func TestUpdatePageLayout_SameHeight(t *testing.T) {
+	v := &PDFViewerPlus{
+		pageHeights:  []float32{100, 100, 100, 100},
+		pageYOffsets: []float32{0, 100, 200, 300},
+		pageImages:   make([]*canvas.Image, 4),
+	}
+	for i := range v.pageImages {
+		v.pageImages[i] = canvas.NewImageFromImage(nil)
+		v.pageImages[i].SetMinSize(fyne.NewSize(50, 100))
+	}
+
+	// 同高度不触发级联更新
+	v.updatePageLayout(2, 50, 100)
+
+	for i := 0; i < 4; i++ {
+		if v.pageYOffsets[i] != float32(i*100) {
+			t.Errorf("pageYOffsets[%d] = %v, want %v", i, v.pageYOffsets[i], i*100)
+		}
+	}
+}
+
+func TestUpdatePageLayout_Bounds(t *testing.T) {
+	v := &PDFViewerPlus{
+		pageHeights:  []float32{100},
+		pageYOffsets: []float32{0},
+		pageImages:   make([]*canvas.Image, 1),
+	}
+
+	// 越界应不 panic
+	v.updatePageLayout(-1, 50, 100)
+	v.updatePageLayout(10, 50, 100)
+
+	// pageImages nil 时应不 panic
+	v.pageImages = nil
+	v.updatePageLayout(0, 50, 100)
+}
+
+// --- reader_windows_plus.go: getCurrentPageFromScroll ---
+
+func TestGetCurrentPageFromScroll(t *testing.T) {
+	sc := container.NewScroll(canvas.NewRectangle(color.Black))
+	sc.Resize(fyne.NewSize(200, 100))
+
+	v := &PDFViewerPlus{
+		pageHeights:   []float32{50, 50, 50},
+		pageYOffsets:  []float32{0, 50, 100},
+		contentScroll: sc,
+		pdfDoc:        &PDFiumDoc{numPages: 3},
+	}
+
+	// viewportCenter=30 (Offset=0 + Height=60/2): 第1页内
+	sc.Offset.Y = 0
+	sc.Resize(fyne.NewSize(200, 60))
+	if p := v.getCurrentPageFromScroll(); p != 1 {
+		t.Errorf("center=30 → page=%d, want 1", p)
+	}
+
+	// viewportCenter=50 (Offset=0 + Height=100/2): pageYOffsets[1]=50，二分到第2页
+	sc.Offset.Y = 0
+	sc.Resize(fyne.NewSize(200, 100))
+	if p := v.getCurrentPageFromScroll(); p != 2 {
+		t.Errorf("center=50 → page=%d, want 2", p)
+	}
+
+	// viewportCenter=125 (Offset=75 + Height=100/2): 第3页
+	sc.Offset.Y = 75
+	sc.Resize(fyne.NewSize(200, 100))
+	if p := v.getCurrentPageFromScroll(); p != 3 {
+		t.Errorf("center=125 → page=%d, want 3", p)
+	}
+}
+
+func TestGetCurrentPageFromScroll_Nil(t *testing.T) {
+	v := &PDFViewerPlus{currentPage: 5}
+	if p := v.getCurrentPageFromScroll(); p != 5 {
+		t.Errorf("nil scroll → page=%d, want 5", p)
+	}
+}
+
+// --- reader_windows_plus.go: calcFillChunk ---
+
+func TestCalcFillChunk(t *testing.T) {
+	// ≤500 页 → 全量
+	if c := calcFillChunk(140, 0); c != 140 {
+		t.Errorf("n=140 → chunk=%d, want 140", c)
+	}
+	if c := calcFillChunk(500, 0); c != 500 {
+		t.Errorf("n=500 → chunk=%d, want 500", c)
+	}
+
+	// >500 页首次 → 500
+	if c := calcFillChunk(800, 0); c != 500 {
+		t.Errorf("n=800 first → chunk=%d, want 500", c)
+	}
+	if c := calcFillChunk(800, 3); c != 497 {
+		t.Errorf("n=800 lastFilled=3 → chunk=%d, want 497", c)
+	}
+
+	// >500 页后续 → 100
+	if c := calcFillChunk(800, 500); c != 100 {
+		t.Errorf("n=800 lastFilled=500 → chunk=%d, want 100", c)
+	}
+	if c := calcFillChunk(800, 600); c != 100 {
+		t.Errorf("n=800 lastFilled=600 → chunk=%d, want 100", c)
+	}
+	if c := calcFillChunk(800, 700); c != 100 {
+		t.Errorf("n=800 lastFilled=700 → chunk=%d, want 100", c)
+	}
+
+	// 恰好填满：lastFilled=799, n=800 → chunk=100 被 target 截断（由调用者处理）
+	if c := calcFillChunk(800, 799); c != 100 {
+		t.Errorf("n=800 lastFilled=799 → chunk=%d, want 100 (capped by caller)", c)
+	}
+}
+
+// --- reader_pdf_plus.go: GetPagePlus fast path ---
+
+func TestGetPagePlusFastPath(t *testing.T) {
+	d := &PDFiumDoc{
+		numPages: 3,
+		pages: []*PDFiumPage{
+			{Index: 0, Width: 612, Height: 792, Loaded: true},
+			nil,
+			{Index: 2, Width: 800, Height: 600, Loaded: true},
+		},
+	}
+
+	// 快路径 — 页已加载
+	p := d.GetPagePlus(0)
+	if p == nil || p.Width != 612 || p.Height != 792 {
+		t.Errorf("page 0 = %+v, want Width=612 Height=792", p)
+	}
+
+	// 快路径 — 另一页
+	p = d.GetPagePlus(2)
+	if p == nil || p.Width != 800 || p.Height != 600 {
+		t.Errorf("page 2 = %+v, want Width=800 Height=600", p)
+	}
+
+	// 越界 → nil
+	if p := d.GetPagePlus(-1); p != nil {
+		t.Error("index=-1 should return nil")
+	}
+	if p := d.GetPagePlus(10); p != nil {
+		t.Error("index=10 should return nil")
+	}
+}
+
+func TestGetPagePlusFastPath_DoubleCheck(t *testing.T) {
+	// 验证写锁 double-check：pages[idx] 在 Lock 之后再检查
+	d := &PDFiumDoc{
+		numPages: 3,
+		pages: []*PDFiumPage{
+			nil,                                                              // RLock 看到 nil
+			nil,                                                              // 不相关
+			nil,                                                              // 不相关
+		},
+	}
+
+	// 同时填 pages[0] — 模拟并发 goroutine 在 RLock 释放后写锁获取前填充了数据
+	loaded := &PDFiumPage{Index: 0, Width: 999, Height: 999, Loaded: true}
+	d.pages[0] = loaded
+
+	p := d.GetPagePlus(0)
+	if p == nil || p.Width != 999 {
+		t.Errorf("double-check failed: got %+v, want Width=999", p)
+	}
+}
+
+func TestGetPagePlusConcurrent(t *testing.T) {
+	d := &PDFiumDoc{
+		numPages: 1,
+		pages: []*PDFiumPage{
+			{Index: 0, Width: 612, Height: 792, Loaded: true},
+		},
+	}
+
+	// 多 goroutine 并发调用不应死锁或 panic
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p := d.GetPagePlus(0)
+			if p == nil || p.Width != 612 {
+				t.Errorf("concurrent: got %+v", p)
+			}
+		}()
+	}
+	wg.Wait()
 }

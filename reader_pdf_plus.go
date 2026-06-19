@@ -113,6 +113,7 @@ func (d *PDFiumDoc) PageCountPlus() int {
 }
 
 func (d *PDFiumDoc) InvalidateDimensions(pageIndex int) {
+	logD("[inval-dim] page=%d", pageIndex+1)
 	d.mu.Lock()
 	if pageIndex >= 0 && pageIndex < len(d.pages) {
 		d.pages[pageIndex] = nil
@@ -136,14 +137,27 @@ func (d *PDFiumDoc) GetPagePlus(index int) *PDFiumPage {
 	}
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.pages[index] != nil {
-		return d.pages[index]
+		p := d.pages[index]
+		d.mu.Unlock()
+		return p
+	}
+	d.mu.Unlock()
+
+	logD("[GetPagePlus] slow path page=%d", index+1)
+	info, err := d.doc.GetPageInfo(index)
+	var rotation int
+	if err == nil {
+		rotation, _ = d.doc.GetPageRotation(index)
 	}
 
-	info, err := d.doc.GetPageInfo(index)
+	d.mu.Lock()
+	if d.pages[index] != nil {
+		p := d.pages[index]
+		d.mu.Unlock()
+		return p
+	}
 	if err == nil {
-		rotation, _ := d.doc.GetPageRotation(index)
 		d.pages[index] = &PDFiumPage{
 			Index:    index,
 			Width:    info.Width,
@@ -159,7 +173,9 @@ func (d *PDFiumDoc) GetPagePlus(index int) *PDFiumPage {
 			Loaded: false,
 		}
 	}
-	return d.pages[index]
+	p = d.pages[index]
+	d.mu.Unlock()
+	return p
 }
 
 func (d *PDFiumDoc) RenderPagePlus(pageIndex int, zoom float32, canvasScale float32, nightMode bool) (image.Image, error) {
@@ -180,7 +196,7 @@ func (d *PDFiumDoc) RenderPagePlus(pageIndex int, zoom float32, canvasScale floa
 		nightMode: nightMode,
 	}
 
-	const cacheLimit = 50
+	const cacheLimit = 1000
 
 	d.zoomMu.Lock()
 	if img, ok := d.zoomCache[key]; ok {
@@ -376,6 +392,7 @@ func (d *PDFiumDoc) AnnotMoveFreeText(pageIndex, annotIndex int, dx, dy float32)
 }
 
 func (d *PDFiumDoc) ClearZoomCache() {
+	logD("[zoom-cache] CLEAR (was size=%d)", len(d.zoomCache))
 	d.zoomMu.Lock()
 	d.zoomCache = make(map[zoomCacheKeyPlus]*image.RGBA)
 	d.zoomLRU.Init()

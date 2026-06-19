@@ -195,7 +195,8 @@ type PDFViewerPlus struct {
 	continuousBuildVer  int32
 	refreshScheduled    bool
 	lastFilled          int
-	filling             bool
+	filling             int32
+	continuousVBox      *fyne.Container
 }
 
 type scrollOverlay struct {
@@ -222,8 +223,9 @@ func (s *scrollOverlay) Scrolled(ev *fyne.ScrollEvent) {
 		}
 
 		// Trigger background fill if approaching filled boundary
-		if !v.filling && v.currentPage >= v.lastFilled-10 && v.lastFilled < len(v.pageImages) {
-			v.filling = true
+		if atomic.LoadInt32(&v.filling) == 0 && v.currentPage >= v.lastFilled-10 && v.lastFilled < len(v.pageImages) {
+			logD("[fill-trigger] scroll: currentPage=%d lastFilled=%d n=%d", v.currentPage, v.lastFilled, len(v.pageImages))
+			atomic.StoreInt32(&v.filling, 1)
 			go v.fillCacheBackground()
 		}
 		return
@@ -757,6 +759,7 @@ func (v *PDFViewerPlus) initUIPlus() {
 		v.resizeTimer = time.AfterFunc(300*time.Millisecond, func() {
 			fyne.Do(func() {
 				if v.pdfDoc != nil {
+					logD("[resize-timer] fire cont=%v fitWidth=%v", v.continuousMode, v.fitWidthMode)
 					v.autoFitPlus()
 				}
 			})
@@ -1038,12 +1041,14 @@ func (v *PDFViewerPlus) createMergedToolbarPlus() {
 			v.selectBtn.Refresh()
 			v.noteHoverLayer.Hide()
 			v.annotBottomBar.Show()
+			v.mainArea.Refresh()
 			v.annotToolLayer.SetDefaultTool(AnnotToolHighlight)
 			v.annotToggleBtn.Importance = widget.HighImportance
 		} else {
 			v.annotToolLayer.SetAnnotMode(false)
 			v.noteHoverLayer.Show()
 			v.annotBottomBar.Hide()
+			v.mainArea.Refresh()
 			v.annotToggleBtn.Importance = widget.MediumImportance
 		}
 		v.annotToggleBtn.Refresh()
@@ -1333,21 +1338,22 @@ func (v *PDFViewerPlus) GoToPagePlus(page int) {
 	}
 	logD("[navigate]   %d -> %d  fitWidth=%v zoom=%.2f", v.currentPage, page, v.fitWidthMode, v.zoom)
 	v.prevPage = v.currentPage
-	v.currentPage = page
 	v.scrollDebt = 0
 	v.pageTotalLabel.SetText(fmt.Sprintf("/ %d", v.totalPages))
-	v.pageEntry.SetText(fmt.Sprintf("%d", v.currentPage))
-	v.highlightCurrentPagePlus()
 
 	if v.continuousMode {
 		v.updateContinuousCurrentPage(page)
 		pageY := v.getPageYOffset(page - 1)
-		v.contentScroll.Offset = fyne.NewPos(0, pageY)
-		v.contentScroll.Refresh()
-	} else if v.fitWidthMode {
-		v.FitWidthPlus()
+		v.contentScroll.ScrollToOffset(fyne.NewPos(0, pageY))
 	} else {
-		v.renderCurrentPagePlus()
+		v.currentPage = page
+		v.pageEntry.SetText(fmt.Sprintf("%d", v.currentPage))
+		v.highlightCurrentPagePlus()
+		if v.fitWidthMode {
+			v.FitWidthPlus()
+		} else {
+			v.renderCurrentPagePlus()
+		}
 	}
 
 	v.scrollThumbnailsToPagePlus(page)
@@ -2150,19 +2156,10 @@ func (v *PDFViewerPlus) syncContinuousAnnotMode() {
 func (v *PDFViewerPlus) finalizeContinuousLayout() {
 	n := v.pdfDoc.numPages
 
-	// Manual zoom mode: skip scan, just render 3 pages + start background fill
+	// Manual zoom mode: start background fill immediately
 	if !v.fitWidthMode {
-		count := 0
-		done := make(chan struct{}, 3)
-		for i := 0; i < 3 && i < n; i++ {
-			v.renderContinuousPage(i, done)
-			count++
-		}
-		for i := 0; i < count; i++ {
-			<-done
-		}
-		v.lastFilled = 3
-		v.filling = true
+		v.lastFilled = 0
+		atomic.StoreInt32(&v.filling, 1)
 		go v.fillCacheBackground()
 		return
 	}
@@ -2208,24 +2205,14 @@ func (v *PDFViewerPlus) finalizeContinuousLayout() {
 				v.buildContinuousContent()
 			}
 		})
-		// Now in goroutine: render first 3 pages and wait for them
-		count := 0
-		done := make(chan struct{}, 3)
-		for i := 0; i < 3 && i < n; i++ {
-			v.renderContinuousPage(i, done)
-			count++
-		}
-		for i := 0; i < count; i++ {
-			<-done
-		}
-		v.lastFilled = 3
-		v.filling = true
+		v.lastFilled = 0
+		atomic.StoreInt32(&v.filling, 1)
 		go v.fillCacheBackground()
 		return nil
 	}()
 
 	if err != nil {
-		// Fallback: PDFium scan in background (no progress dialog since this is simplified)
+		// Fallback: PDFium scan in background
 		var maxPW float32
 		for i := 0; i < n; i++ {
 			if !v.continuousMode {
@@ -2258,44 +2245,72 @@ func (v *PDFViewerPlus) finalizeContinuousLayout() {
 				v.buildContinuousContent()
 			}
 		})
-		count := 0
-		done := make(chan struct{}, 3)
-		for i := 0; i < 3 && i < n; i++ {
-			v.renderContinuousPage(i, done)
-			count++
-		}
-		for i := 0; i < count; i++ {
-			<-done
-		}
-		v.lastFilled = 3
-		v.filling = true
+		v.lastFilled = 0
+		atomic.StoreInt32(&v.filling, 1)
 		go v.fillCacheBackground()
 	}
 }
 
+func calcFillChunk(n, lastFilled int) int {
+	if n <= 500 {
+		return n
+	}
+	if lastFilled < 500 {
+		return 500 - lastFilled
+	}
+	return 100
+}
+
 func (v *PDFViewerPlus) fillCacheBackground() {
-	defer func() { v.filling = false }()
+	defer func() { atomic.StoreInt32(&v.filling, 0); logD("[fill] done lastFilled=%d", v.lastFilled) }()
 	n := len(v.pageImages)
-	target := v.lastFilled + 27 // Fill next 27 pages (3→30, 30→57, etc.)
+	chunk := calcFillChunk(n, v.lastFilled)
+	target := v.lastFilled + chunk
 	if target > n {
 		target = n
 	}
-	for batchStart := v.lastFilled; batchStart < target; batchStart += 3 {
+	logD("[fill] start lastFilled=%d target=%d chunk=%d", v.lastFilled, target, chunk)
+	count := target - v.lastFilled
+	if count <= 0 {
+		return
+	}
+
+	canvasScale := v.parentWin.Canvas().Scale()
+	curNightMode := v.nightMode
+
+	sem := make(chan struct{}, 6)
+	var wg sync.WaitGroup
+
+	for i := v.lastFilled; i < target; i++ {
 		if !v.continuousMode {
 			return
 		}
-		count := 0
-		done := make(chan struct{}, 3)
-		for i := batchStart; i < batchStart+3 && i < target; i++ {
-			if v.continuousMode {
-				v.renderContinuousPage(i, done)
-				count++
+		v.pageRendering[i] = true
+		sem <- struct{}{}
+		wg.Add(1)
+		idx := i
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			img, err := v.pdfDoc.RenderPagePlus(idx, v.zoom, canvasScale, curNightMode)
+			if !v.continuousMode || idx >= len(v.pageRendering) {
+				return
 			}
-		}
-		for i := 0; i < count; i++ {
-			<-done
-		}
+			v.pageRendering[idx] = false
+			if err != nil || img == nil {
+				return
+			}
+			fyne.Do(func() {
+				if !v.continuousMode || idx >= len(v.pageImages) || v.pageImages[idx] == nil {
+					return
+				}
+				v.pageImages[idx].Image = img
+				v.pageRendered[idx] = true
+			})
+		}()
 	}
+	wg.Wait()
+	logD("[fill] all renders done, target=%d", target)
 	v.lastFilled = target
 }
 
@@ -2306,20 +2321,41 @@ func (v *PDFViewerPlus) toggleContinuousMode() {
 	v.continuousMode = !v.continuousMode
 	v.lastFilled = 0
 	if v.continuousMode {
-		v.buildContinuousContent()
-		go v.finalizeContinuousLayout()
+		v.contentScroll.Content = container.NewCenter(
+			widget.NewLabel("  正在准备连续滚动..."),
+		)
+		v.contentScroll.Refresh()
+		go func() {
+			time.Sleep(80 * time.Millisecond)
+			fyne.DoAndWait(func() {
+				v.buildContinuousContent()
+				atomic.StoreInt32(&v.filling, 1)
+				go v.finalizeContinuousLayout()
+			})
+			for atomic.LoadInt32(&v.filling) == 1 && v.continuousMode {
+				time.Sleep(100 * time.Millisecond)
+			}
+			fyne.Do(func() {
+				if v.continuousMode && v.continuousVBox != nil {
+					v.contentScroll.Content = v.continuousVBox
+					pageY := v.getPageYOffset(v.currentPage - 1)
+					v.contentScroll.Offset = fyne.NewPos(0, pageY)
+					v.contentScroll.Refresh()
+					v.continuousBtn.Importance = widget.HighImportance
+					v.continuousBtn.Refresh()
+				}
+			})
+		}()
+		return
 	} else {
 		v.restorePageMode()
 	}
-	if v.continuousMode {
-		v.continuousBtn.Importance = widget.HighImportance
-	} else {
-		v.continuousBtn.Importance = widget.MediumImportance
-	}
+	v.continuousBtn.Importance = widget.MediumImportance
 	v.continuousBtn.Refresh()
 }
 
 func (v *PDFViewerPlus) buildContinuousContent() {
+	logD("[cont-build] START ver=%d n=%d", v.continuousBuildVer, v.pdfDoc.numPages)
 	atomic.AddInt32(&v.continuousBuildVer, 1)
 	n := v.pdfDoc.numPages
 	v.pageImages = make([]*canvas.Image, n)
@@ -2367,8 +2403,7 @@ func (v *PDFViewerPlus) buildContinuousContent() {
 		}
 		objs = append(objs, s)
 	}
-	v.contentScroll.Content = container.NewVBox(objs...)
-	v.contentScroll.Refresh()
+	v.continuousVBox = container.NewVBox(objs...)
 
 	// Ensure text layers for ±1 pages
 	for di := -1; di <= 1; di++ {
@@ -2412,6 +2447,7 @@ func (v *PDFViewerPlus) ensureTextLayer(pageIdx int) *TextSelectionLayer {
 }
 
 func (v *PDFViewerPlus) restorePageMode() {
+	logD("[cont-restore] restoring page mode, was cont=%v", v.continuousMode)
 	v.pageImages = nil
 	v.pageStacks = nil
 	v.pageRendered = nil
@@ -2453,6 +2489,7 @@ func (v *PDFViewerPlus) scheduleRefresh() {
 	fyne.Do(func() {
 		v.refreshScheduled = false
 		if v.contentScroll != nil {
+			logD("[refresh] contentScroll.Refresh() cont=%v", v.continuousMode)
 			v.contentScroll.Refresh()
 		}
 	})
@@ -2468,6 +2505,8 @@ func (v *PDFViewerPlus) renderContinuousPage(pageIdx int, done ...chan<- struct{
 	if v.pageRendering[pageIdx] {
 		return
 	}
+	logD("[cont-render] page=%d MISS pageRendered=%v pageRendering=%v cacheSize=%d",
+		pageIdx+1, v.pageRendered[pageIdx], v.pageRendering[pageIdx], len(v.pdfDoc.zoomCache))
 
 	canvasScale := v.parentWin.Canvas().Scale()
 	curNightMode := v.nightMode
@@ -2491,8 +2530,10 @@ func (v *PDFViewerPlus) renderContinuousPage(pageIdx int, done ...chan<- struct{
 			v.pageImages[pageIdx].Image = cached
 			v.pageImages[pageIdx].Refresh()
 			v.pageRendered[pageIdx] = true
-			v.scheduleRefresh()
-			v.verifyPageDimensions(pageIdx, cached, canvasScale, curNightMode)
+			if !v.continuousMode {
+				v.scheduleRefresh()
+				v.verifyPageDimensions(pageIdx, cached, canvasScale, curNightMode)
+			}
 			if len(done) > 0 {
 				done[0] <- struct{}{}
 			}
@@ -2535,8 +2576,10 @@ func (v *PDFViewerPlus) renderContinuousPage(pageIdx int, done ...chan<- struct{
 			v.pageImages[pageIdx].Refresh()
 			v.pageRendering[pageIdx] = false
 			v.pageRendered[pageIdx] = true
-			v.scheduleRefresh()
-			v.verifyPageDimensions(pageIdx, img, canvasScale, curNightMode)
+			if !v.continuousMode {
+				v.scheduleRefresh()
+				v.verifyPageDimensions(pageIdx, img, canvasScale, curNightMode)
+			}
 			if len(done) > 0 {
 				done[0] <- struct{}{}
 			}
@@ -2631,6 +2674,12 @@ func (v *PDFViewerPlus) updateContinuousCurrentPage(newPage int) {
 	v.scrollThumbnailsToPagePlus(newPage)
 
 	idx := newPage - 1
+	for di := -1; di <= 1; di++ {
+		i := idx + di
+		if i >= 0 && i < len(v.continuousTextLayers) {
+			v.ensureTextLayer(i)
+		}
+	}
 	if idx > 0 {
 		v.renderContinuousPage(idx - 1)
 	}
@@ -2641,6 +2690,10 @@ func (v *PDFViewerPlus) updateContinuousCurrentPage(newPage int) {
 
 func (v *PDFViewerPlus) autoFitPlus() {
 	if v.pdfDoc == nil {
+		return
+	}
+	if v.continuousMode {
+		logD("[autoFit] skip in continuous mode")
 		return
 	}
 	if v.fitWidthMode {
