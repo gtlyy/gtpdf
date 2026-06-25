@@ -5,11 +5,14 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	xdraw "golang.org/x/image/draw"
 	"image/jpeg"
 	"image/png"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -196,7 +199,17 @@ type PDFViewerPlus struct {
 	refreshScheduled    bool
 	lastFilled          int
 	filling             int32
-	continuousVBox      *fyne.Container
+	continuousVBox      *virtualScrollPage
+	pageFullImages      [200]*image.RGBA
+	pageFullPages       [200]int
+	pageFullIndex       map[int]int
+	pageThumbs          [200]*image.RGBA
+	fillCount           int
+	fillHead            int
+	ringMu              sync.Mutex
+	scrollDragging      bool
+	scrollDragTimer     *time.Timer
+	scrollDragPage      int
 }
 
 type scrollOverlay struct {
@@ -219,7 +232,26 @@ func (s *scrollOverlay) Scrolled(ev *fyne.ScrollEvent) {
 
 		detectedPage := v.getCurrentPageFromScroll()
 		if detectedPage != v.currentPage {
-			v.updateContinuousCurrentPage(detectedPage)
+			v.currentPage = detectedPage
+			v.pageEntry.SetText(fmt.Sprintf("%d", v.currentPage))
+			v.highlightCurrentPagePlus()
+			v.scrollThumbnailsToPagePlus(detectedPage)
+
+			v.scrollDragging = true
+			v.scrollDragPage = detectedPage
+			if v.scrollDragTimer != nil {
+				v.scrollDragTimer.Stop()
+			}
+			v.scrollDragTimer = time.AfterFunc(50*time.Millisecond, func() {
+				fyne.Do(func() {
+					v.scrollDragging = false
+					if v.continuousMode {
+						v.updateContinuousCurrentPage(detectedPage)
+						v.contentScroll.Refresh()
+					}
+					v.scrollDragTimer = nil
+				})
+			})
 		}
 
 		// Trigger background fill if approaching filled boundary
@@ -1345,6 +1377,7 @@ func (v *PDFViewerPlus) GoToPagePlus(page int) {
 		v.updateContinuousCurrentPage(page)
 		pageY := v.getPageYOffset(page - 1)
 		v.contentScroll.ScrollToOffset(fyne.NewPos(0, pageY))
+		v.continuousVBox.Refresh()
 	} else {
 		v.currentPage = page
 		v.pageEntry.SetText(fmt.Sprintf("%d", v.currentPage))
@@ -2154,101 +2187,38 @@ func (v *PDFViewerPlus) syncContinuousAnnotMode() {
 }
 
 func (v *PDFViewerPlus) finalizeContinuousLayout() {
-	n := v.pdfDoc.numPages
+	canvasScale := v.parentWin.Canvas().Scale()
+	curNightMode := v.nightMode
 
-	// Manual zoom mode: start background fill immediately
-	if !v.fitWidthMode {
-		v.lastFilled = 0
-		atomic.StoreInt32(&v.filling, 1)
-		go v.fillCacheBackground()
-		return
+	// Render page 0 synchronously before showing VBox
+	img, err := v.pdfDoc.RenderPagePlus(0, v.zoom, canvasScale, curNightMode)
+	if err == nil && img != nil {
+		if fullRGBA, ok := img.(*image.RGBA); ok {
+			v.ringMu.Lock()
+			v.fillRingSlotLocked(0, fullRGBA)
+			v.ringMu.Unlock()
+		}
 	}
 
-	// Fit-width mode: scan all pages for max width via pdfcpu
-	err := func() error {
-		f, err := os.Open(v.filePath)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		boundaries, err := api.Boxes(f, nil, model.NewDefaultConfiguration())
-		if err != nil {
-			return err
-		}
-		var maxPW float32
-		for _, pb := range boundaries {
-			mb := pb.MediaBox()
-			if mb != nil {
-				w := float32(mb.Width())
-				if w > maxPW {
-					maxPW = w
-				}
-			}
-		}
-		if maxPW <= 0 {
-			return nil
-		}
-
-		fyne.DoAndWait(func() {
-			if !v.continuousMode {
-				return
-			}
-			currentEstW := float32(595)
-			if page := v.pdfDoc.GetPagePlus(v.currentPage - 1); page != nil {
-				currentEstW = float32(page.Width * float64(v.zoom))
-			}
-			fitZoom := currentEstW / maxPW
-			if v.fitWidthMode && fitZoom < v.zoom {
-				v.zoom = fitZoom
-				v.fitWidthMode = true
-				v.pdfDoc.ClearZoomCache()
-				v.buildContinuousContent()
-			}
-		})
-		v.lastFilled = 0
-		atomic.StoreInt32(&v.filling, 1)
-		go v.fillCacheBackground()
-		return nil
-	}()
-
-	if err != nil {
-		// Fallback: PDFium scan in background
-		var maxPW float32
-		for i := 0; i < n; i++ {
-			if !v.continuousMode {
-				return
-			}
-			page := v.pdfDoc.GetPagePlus(i)
-			if page != nil {
-				w := float32(page.Width)
-				if w > maxPW {
-					maxPW = w
-				}
-			}
-		}
-		if maxPW <= 0 {
+	// Show VBox immediately
+	fyne.Do(func() {
+		if !v.continuousMode {
 			return
 		}
-		fyne.DoAndWait(func() {
-			if !v.continuousMode {
-				return
-			}
-			currentEstW := float32(595)
-			if page := v.pdfDoc.GetPagePlus(v.currentPage - 1); page != nil {
-				currentEstW = float32(page.Width * float64(v.zoom))
-			}
-			fitZoom := currentEstW / maxPW
-			if v.fitWidthMode && fitZoom < v.zoom {
-				v.zoom = fitZoom
-				v.fitWidthMode = true
-				v.pdfDoc.ClearZoomCache()
-				v.buildContinuousContent()
-			}
-		})
-		v.lastFilled = 0
-		atomic.StoreInt32(&v.filling, 1)
-		go v.fillCacheBackground()
-	}
+		v.pageImages[0].Image = img
+		v.pageRendered[0] = true
+		v.contentScroll.Content = v.continuousVBox
+		pageY := v.getPageYOffset(v.currentPage - 1)
+		v.contentScroll.Offset = fyne.NewPos(0, pageY)
+		v.contentScroll.Refresh()
+		v.continuousBtn.Importance = widget.HighImportance
+		v.continuousBtn.Refresh()
+	})
+
+	// Background fill from page 1
+	v.lastFilled = 1
+	atomic.StoreInt32(&v.filling, 1)
+	go v.fillCacheBackground()
 }
 
 func calcFillChunk(n, lastFilled int) int {
@@ -2264,54 +2234,140 @@ func calcFillChunk(n, lastFilled int) int {
 func (v *PDFViewerPlus) fillCacheBackground() {
 	defer func() { atomic.StoreInt32(&v.filling, 0); logD("[fill] done lastFilled=%d", v.lastFilled) }()
 	n := len(v.pageImages)
-	chunk := calcFillChunk(n, v.lastFilled)
-	target := v.lastFilled + chunk
-	if target > n {
-		target = n
+	maxFill := n
+	if maxFill > 200 {
+		maxFill = 200
 	}
-	logD("[fill] start lastFilled=%d target=%d chunk=%d", v.lastFilled, target, chunk)
-	count := target - v.lastFilled
-	if count <= 0 {
+	chunk := calcFillChunk(maxFill, v.lastFilled)
+	target := v.lastFilled + chunk
+	if target > maxFill {
+		target = maxFill
+	}
+	if target <= v.lastFilled {
 		return
 	}
+	logD("[fill] start lastFilled=%d target=%d chunk=%d", v.lastFilled, target, chunk)
 
 	canvasScale := v.parentWin.Canvas().Scale()
 	curNightMode := v.nightMode
 
-	sem := make(chan struct{}, 6)
-	var wg sync.WaitGroup
+	serial := v.lastFilled < 10
+	if serial {
+		end := target
+		if end > 10 {
+			end = 10
+		}
+		for i := v.lastFilled; i < end; i++ {
+			if !v.continuousMode {
+				return
+			}
+			img, err := v.pdfDoc.RenderPagePlus(i, v.zoom, canvasScale, curNightMode)
+			if err != nil || img == nil {
+				continue
+			}
+			fullRGBA, ok := img.(*image.RGBA)
+			if !ok {
+				continue
+			}
+			if !v.continuousMode || v.pageFullIndex == nil {
+				return
+			}
+			v.ringMu.Lock()
+			v.fillRingSlotLocked(i, fullRGBA)
+			v.ringMu.Unlock()
+			fyne.DoAndWait(func() {
+				if v.continuousMode && i < len(v.pageImages) && v.pageImages[i] != nil {
+					if page := v.pdfDoc.GetPagePlus(i); page != nil {
+						w := float32(page.Width * float64(v.zoom))
+						h := float32(page.Height * float64(v.zoom))
+						v.updatePageLayout(i, w, h)
+					}
+					v.pageImages[i].Image = fullRGBA
+					v.pageRendered[i] = true
+				}
+			})
+		}
+		v.lastFilled = end
+		if end >= target {
+			return
+		}
+	}
 
 	for i := v.lastFilled; i < target; i++ {
 		if !v.continuousMode {
 			return
 		}
-		v.pageRendering[i] = true
-		sem <- struct{}{}
-		wg.Add(1)
-		idx := i
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			img, err := v.pdfDoc.RenderPagePlus(idx, v.zoom, canvasScale, curNightMode)
-			if !v.continuousMode || idx >= len(v.pageRendering) {
-				return
-			}
-			v.pageRendering[idx] = false
-			if err != nil || img == nil {
-				return
-			}
-			fyne.Do(func() {
-				if !v.continuousMode || idx >= len(v.pageImages) || v.pageImages[idx] == nil {
+		img, err := v.pdfDoc.RenderPagePlus(i, v.zoom, canvasScale, curNightMode)
+		if err != nil || img == nil {
+			continue
+		}
+		fullRGBA, ok := img.(*image.RGBA)
+		if !ok {
+			continue
+		}
+		if !v.continuousMode || v.pageFullIndex == nil {
+			return
+		}
+		v.ringMu.Lock()
+		if v.pageFullIndex == nil {
+			v.ringMu.Unlock()
+			return
+		}
+		v.fillRingSlotLocked(i, fullRGBA)
+		v.ringMu.Unlock()
+		fyne.Do(func() {
+				if !v.continuousMode || i >= len(v.pageImages) || v.pageImages[i] == nil {
 					return
 				}
-				v.pageImages[idx].Image = img
-				v.pageRendered[idx] = true
+				v.pageImages[i].Image = fullRGBA
+				v.pageRendered[i] = true
 			})
-		}()
 	}
-	wg.Wait()
+
 	logD("[fill] all renders done, target=%d", target)
 	v.lastFilled = target
+}
+
+func (v *PDFViewerPlus) fillRingSlotLocked(pg int, img *image.RGBA) {
+	if idx, ok := v.pageFullIndex[pg]; ok {
+		v.pageFullImages[idx] = img
+		v.pageThumbs[idx] = downscaleRGBA(img, 0.15)
+		return
+	}
+	if v.fillCount >= 200 {
+		oldPg := v.pageFullPages[v.fillHead]
+		if oldPg >= 0 {
+			delete(v.pageFullIndex, oldPg)
+		}
+		v.pageFullImages[v.fillHead] = nil
+		v.pageThumbs[v.fillHead] = nil
+	} else {
+		v.fillCount++
+	}
+	v.pageFullImages[v.fillHead] = img
+	v.pageThumbs[v.fillHead] = downscaleRGBA(img, 0.15)
+	v.pageFullPages[v.fillHead] = pg
+	v.pageFullIndex[pg] = v.fillHead
+	v.fillHead = (v.fillHead + 1) % 200
+}
+
+func (v *PDFViewerPlus) getFullImage(pg int) image.Image {
+	v.ringMu.Lock()
+	defer v.ringMu.Unlock()
+	if idx, ok := v.pageFullIndex[pg]; ok {
+		return v.pageFullImages[idx]
+	}
+	logD("[virt-full] pg=%d MISS ringCount=%d", pg+1, v.fillCount)
+	return nil
+}
+
+func (v *PDFViewerPlus) getThumbImage(pg int) image.Image {
+	v.ringMu.Lock()
+	defer v.ringMu.Unlock()
+	if idx, ok := v.pageFullIndex[pg]; ok {
+		return v.pageThumbs[idx]
+	}
+	return nil
 }
 
 func (v *PDFViewerPlus) toggleContinuousMode() {
@@ -2329,21 +2385,7 @@ func (v *PDFViewerPlus) toggleContinuousMode() {
 			time.Sleep(80 * time.Millisecond)
 			fyne.DoAndWait(func() {
 				v.buildContinuousContent()
-				atomic.StoreInt32(&v.filling, 1)
 				go v.finalizeContinuousLayout()
-			})
-			for atomic.LoadInt32(&v.filling) == 1 && v.continuousMode {
-				time.Sleep(100 * time.Millisecond)
-			}
-			fyne.Do(func() {
-				if v.continuousMode && v.continuousVBox != nil {
-					v.contentScroll.Content = v.continuousVBox
-					pageY := v.getPageYOffset(v.currentPage - 1)
-					v.contentScroll.Offset = fyne.NewPos(0, pageY)
-					v.contentScroll.Refresh()
-					v.continuousBtn.Importance = widget.HighImportance
-					v.continuousBtn.Refresh()
-				}
 			})
 		}()
 		return
@@ -2393,17 +2435,15 @@ func (v *PDFViewerPlus) buildContinuousContent() {
 		v.pageStacks[i] = stack
 	}
 
-	// Build VBox with separators
-	var objs []fyne.CanvasObject
-	for _, s := range v.pageStacks {
-		if len(objs) > 0 {
-			sep := canvas.NewRectangle(color.NRGBA{0, 0, 0, 25})
-			sep.SetMinSize(fyne.NewSize(1, 4))
-			objs = append(objs, sep)
-		}
-		objs = append(objs, s)
+	v.continuousVBox = newVirtualScrollPage(v)
+
+	v.pageFullIndex = make(map[int]int)
+	for i := range v.pageFullPages {
+		v.pageFullPages[i] = -1
 	}
-	v.continuousVBox = container.NewVBox(objs...)
+	v.fillCount = 0
+	v.fillHead = 0
+	v.scrollDragging = false
 
 	// Ensure text layers for ±1 pages
 	for di := -1; di <= 1; di++ {
@@ -2452,6 +2492,11 @@ func (v *PDFViewerPlus) restorePageMode() {
 	v.pageStacks = nil
 	v.pageRendered = nil
 	v.pageRendering = nil
+	v.pageFullIndex = nil
+	for i := range v.pageFullImages {
+		v.pageFullImages[i] = nil
+		v.pageThumbs[i] = nil
+	}
 	v.continuousTextLayers = nil
 	v.continuousAnnotLayers = nil
 	v.continuousAnnotToolLayers = nil
@@ -2460,6 +2505,7 @@ func (v *PDFViewerPlus) restorePageMode() {
 	v.continuousCtxOverlays = nil
 	v.pageHeights = nil
 	v.pageYOffsets = nil
+	v.continuousVBox = nil
 	v.continuousMode = false
 
 	v.lastRenderPage = -1
@@ -2607,8 +2653,14 @@ func (v *PDFViewerPlus) verifyPageDimensions(pageIdx int, img image.Image, canva
 				if v.fitWidthMode {
 					v.FitWidthPlus()
 				} else {
-					v.renderCurrentPagePlus()
-				}
+	v.renderCurrentPagePlus()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		runtime.GC()
+		debug.FreeOSMemory()
+	}()
+}
 			}
 		}
 	}
@@ -3244,6 +3296,13 @@ func (v *PDFViewerPlus) CloseFilePlus() {
 	v.pageStacks = nil
 	v.pageRendered = nil
 	v.pageRendering = nil
+	v.ringMu.Lock()
+	v.pageFullIndex = nil
+	for i := range v.pageFullImages {
+		v.pageFullImages[i] = nil
+		v.pageThumbs[i] = nil
+	}
+	v.ringMu.Unlock()
 	v.continuousTextLayers = nil
 	v.continuousAnnotLayers = nil
 	v.continuousAnnotToolLayers = nil
@@ -3252,6 +3311,7 @@ func (v *PDFViewerPlus) CloseFilePlus() {
 	v.continuousCtxOverlays = nil
 	v.pageHeights = nil
 	v.pageYOffsets = nil
+	v.continuousVBox = nil
 
 	v.canvasImg = nil
 	v.thumbCache = make(map[int]image.Image)
@@ -3265,6 +3325,13 @@ func (v *PDFViewerPlus) CloseFilePlus() {
 	if v.thumbList != nil {
 		v.thumbList.Refresh()
 	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		runtime.GC()
+		debug.FreeOSMemory()
+	}()
+
 	v.bookmarkData = nil
 	v.bookmarkTreeIDs = nil
 	if v.bookmarkTree != nil {
@@ -3814,4 +3881,22 @@ func (m *minSizeWrap) MinSize() fyne.Size {
 
 func (m *minSizeWrap) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(m.child)
+}
+
+func downscaleRGBA(src *image.RGBA, scale float64) *image.RGBA {
+	if src == nil || scale <= 0 || scale >= 1 {
+		return src
+	}
+	sb := src.Bounds()
+	newW := int(float64(sb.Dx())*scale + 0.5)
+	newH := int(float64(sb.Dy())*scale + 0.5)
+	if newW < 1 {
+		newW = 1
+	}
+	if newH < 1 {
+		newH = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	xdraw.BiLinear.Scale(dst, dst.Bounds(), src, sb, draw.Src, nil)
+	return dst
 }
