@@ -2384,6 +2384,23 @@ func (v *PDFViewerPlus) toggleContinuousMode() {
 		go func() {
 			time.Sleep(80 * time.Millisecond)
 			fyne.DoAndWait(func() {
+				if v.fitWidthMode {
+					var maxW float64
+					for i := 0; i < v.pdfDoc.numPages; i++ {
+						if page := v.pdfDoc.GetPagePlus(i); page != nil && page.Width > maxW {
+							maxW = page.Width
+						}
+					}
+					if maxW > 0 {
+						fitZoom := v.contentWidth() / float32(maxW)
+						if fitZoom < v.zoom {
+							v.zoom = fitZoom
+							v.zoomUpdating = true
+							v.zoomEntry.SetText(fmt.Sprintf("%.0f%%", v.zoom*100))
+							v.zoomUpdating = false
+						}
+					}
+				}
 				v.buildContinuousContent()
 				go v.finalizeContinuousLayout()
 			})
@@ -2413,22 +2430,21 @@ func (v *PDFViewerPlus) buildContinuousContent() {
 	v.pageHeights = make([]float32, n)
 	v.pageYOffsets = make([]float32, n)
 
-	// Use current page dimensions as estimate for all pages
-	var estW, estH float32 = 595, 842
-	if page := v.pdfDoc.GetPagePlus(v.currentPage - 1); page != nil {
-		estW = float32(page.Width * float64(v.zoom))
-		estH = float32(page.Height * float64(v.zoom))
-	}
-
 	var yOffset float32
 	for i := 0; i < n; i++ {
+		w := float32(595)
+		h := float32(842)
+		if page := v.pdfDoc.GetPagePlus(i); page != nil {
+			w = float32(page.Width * float64(v.zoom))
+			h = float32(page.Height * float64(v.zoom))
+		}
 		v.pageYOffsets[i] = yOffset
-		v.pageHeights[i] = estH
-		yOffset += estH + 4
+		v.pageHeights[i] = h
+		yOffset += h + 4
 
 		img := canvas.NewImageFromImage(nil)
 		img.FillMode = canvas.ImageFillOriginal
-		img.SetMinSize(fyne.NewSize(estW, estH))
+		img.SetMinSize(fyne.NewSize(w, h))
 		v.pageImages[i] = img
 
 		stack := container.NewStack(img)
@@ -2524,7 +2540,7 @@ func (v *PDFViewerPlus) restorePageMode() {
 	v.continuousBtn.Importance = widget.MediumImportance
 	v.continuousBtn.Refresh()
 
-	v.renderCurrentPagePlus()
+	v.FitWidthPlus()
 }
 
 func (v *PDFViewerPlus) scheduleRefresh() {
