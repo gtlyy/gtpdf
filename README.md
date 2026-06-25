@@ -1,4 +1,4 @@
-# GtPDF V1.9.2
+# GtPDF V1.10.2
 ![](./screenshot.png)
 <hr>
 
